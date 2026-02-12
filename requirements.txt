@@ -1,4 +1,5 @@
 streamlit
 psycopg2-binary
 pandas
+openpyxl
 streamlit-cookies-manager
