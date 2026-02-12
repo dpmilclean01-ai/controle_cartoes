@@ -249,27 +249,28 @@ if menu == "Importar Base Excel":
         inseridos = 0
         atualizados = 0
 
-        from psycopg2.extras import execute_batch
+        from psycopg2.extras import execute_values
 
         registros = []
 
-        for _, row in df.iterrows():
+        df["matricula"] = df["matricula"].astype(str).str.strip()
+        df["data_admissao"] = df["data_admissao"].apply(formatar_data)
+        df["data_demissao"] = df["data_demissao"].apply(formatar_data)
+        df["ultima_atualizacao"] = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
 
-            matricula = str(row["matricula"]).strip()
+        registros = df[[
+            "matricula",
+            "nome",
+            "contrato",
+            "responsavel",
+            "data_admissao",
+            "data_demissao",
+            "sit_folha"
+        ]].values.tolist()
 
-            data_adm = formatar_data(row["data_admissao"])
-            data_dem = formatar_data(row["data_demissao"])
+        # adiciona ultima_atualizacao
+        registros = [tuple(r + [df["ultima_atualizacao"][0]]) for r in registros]
 
-            registros.append((
-                matricula,
-                row["nome"],
-                row["contrato"],
-                row["responsavel"],
-                data_adm,
-                data_dem,
-                row["sit_folha"],
-                datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-            ))
 
         query = """
         INSERT INTO base_colaboradores
@@ -287,7 +288,7 @@ if menu == "Importar Base Excel":
             ultima_atualizacao = EXCLUDED.ultima_atualizacao
         """
 
-        execute_batch(cursor, query, registros, page_size=1000)
+        execute_values(cursor, query, registros, page_size=2000)
         conn.commit()
 
         st.success("✅ Importação concluída!")
