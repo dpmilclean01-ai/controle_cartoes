@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 import os
 from streamlit_cookies_manager import EncryptedCookieManager
+from psycopg2.extras import execute_batch
 
 def formatar_data(valor):
     if pd.isna(valor) or valor == "":
@@ -45,6 +46,7 @@ if not cookies.ready():
 # CRIAÇÃO TABELAS
 # -------------------------
 
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS base_colaboradores (
     id SERIAL PRIMARY KEY,
@@ -57,6 +59,11 @@ CREATE TABLE IF NOT EXISTS base_colaboradores (
     sit_folha TEXT,
     ultima_atualizacao TEXT
 )
+""")
+
+cursor.execute("""
+CREATE INDEX IF NOT EXISTS idx_matricula
+ON base_colaboradores (matricula)
 """)
 
 cursor.execute("""
@@ -104,6 +111,11 @@ CREATE TABLE IF NOT EXISTS logs (
     data TEXT
 )
 """)
+
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_base_matricula ON base_colaboradores(matricula)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes ON cartoes_ponto(mes_id)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_matricula ON cartoes_ponto(matricula)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes ON caixas(mes_id)")
 
 conn.commit()
 
@@ -237,6 +249,10 @@ if menu == "Importar Base Excel":
         inseridos = 0
         atualizados = 0
 
+        from psycopg2.extras import execute_batch
+
+        registros = []
+
         for _, row in df.iterrows():
 
             matricula = str(row["matricula"]).strip()
@@ -244,45 +260,34 @@ if menu == "Importar Base Excel":
             data_adm = formatar_data(row["data_admissao"])
             data_dem = formatar_data(row["data_demissao"])
 
-            cursor.execute("SELECT id FROM base_colaboradores WHERE matricula = %s", (matricula,))
-            existe = cursor.fetchone()
+            registros.append((
+                matricula,
+                row["nome"],
+                row["contrato"],
+                row["responsavel"],
+                data_adm,
+                data_dem,
+                row["sit_folha"],
+                datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+            ))
 
-            if existe:
-                cursor.execute("""
-                    UPDATE base_colaboradores
-                    SET nome=%s, contrato=%s, responsavel=%s,
-                        data_admissao=%s, data_demissao=%s, sit_folha=%s,
-                        ultima_atualizacao=%s
-                    WHERE matricula=%s
-                """, (
-                    row["nome"],
-                    row["contrato"],
-                    row["responsavel"],
-                    data_adm,
-                    data_dem,
-                    row["sit_folha"],
-                    datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
-                    matricula
-                ))
-                atualizados += 1
-            else:
-                cursor.execute("""
-                    INSERT INTO base_colaboradores
-                    (matricula, nome, contrato, responsavel,
-                     data_admissao, data_demissao, sit_folha, ultima_atualizacao)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (
-                    matricula,
-                    row["nome"],
-                    row["contrato"],
-                    row["responsavel"],
-                    data_adm,
-                    data_dem,
-                    row["sit_folha"],
-                    datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-                ))
-                inseridos += 1
+        query = """
+        INSERT INTO base_colaboradores
+        (matricula, nome, contrato, responsavel,
+        data_admissao, data_demissao, sit_folha, ultima_atualizacao)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (matricula)
+        DO UPDATE SET
+            nome = EXCLUDED.nome,
+            contrato = EXCLUDED.contrato,
+            responsavel = EXCLUDED.responsavel,
+            data_admissao = EXCLUDED.data_admissao,
+            data_demissao = EXCLUDED.data_demissao,
+            sit_folha = EXCLUDED.sit_folha,
+            ultima_atualizacao = EXCLUDED.ultima_atualizacao
+        """
 
+        execute_batch(cursor, query, registros, page_size=1000)
         conn.commit()
 
         st.success("✅ Importação concluída!")
@@ -411,28 +416,26 @@ if menu == "Gestão de Caixas":
                 format_func=lambda x: f"{x} - {funcionarios[funcionarios['matricula']==x]['nome'].values[0]}"
             )
                 if st.button("Salvar Arquivamento"):
+                    registros = []
+
                     for mat in selecionados:
-                        try:
-                            cursor.execute("""
-                                INSERT INTO cartoes_ponto
-                                (matricula, caixa_id, mes_id, data_registro)
-                                VALUES (%s,%s,%s,%s)
-                            """, (mat, caixa_id, mes_id, datetime.now().strftime("%d-%m-%Y %H:%M:%S")))
+                        registros.append((
+                            mat,
+                            caixa_id,
+                            mes_id,
+                            datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                        ))
 
-                            cursor.execute("""
-                                INSERT INTO logs (usuario, acao, detalhe, data)
-                                VALUES (%s,%s,%s,%s)
-                            """, (
-                                st.session_state.usuario_logado,
-                                "ARQUIVAMENTO",
-                                f"Matricula {mat} - Caixa {caixa_id} - Mes {mes_id}",
-                                datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-                            ))
+                    query = """
+                    INSERT INTO cartoes_ponto
+                    (matricula, caixa_id, mes_id, data_registro)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (matricula, mes_id) DO NOTHING
+                    """
 
-                        except psycopg2.IntegrityError:
-                            conn.rollback()
-                            st.warning(f"Matrícula {mat} já possui cartão neste mês.")
+                    execute_batch(cursor, query, registros, page_size=500)
                     conn.commit()
+
                     st.success("Processamento concluído!")
 
 # -------------------------
