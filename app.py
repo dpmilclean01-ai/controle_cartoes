@@ -8,6 +8,14 @@ from datetime import datetime
 import os
 from streamlit_cookies_manager import EncryptedCookieManager
 
+def formatar_data(valor):
+    if pd.isna(valor) or valor == "":
+        return None
+    try:
+        return pd.to_datetime(valor, dayfirst=True).strftime("%d-%m-%Y")
+    except:
+        return None
+
 # -------------------------
 # CONEXÃO BANCO
 # -------------------------
