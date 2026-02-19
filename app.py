@@ -140,7 +140,14 @@ if not usuario_admin:
 if "usuario_logado" not in st.session_state:
     st.session_state.usuario_logado = None
     st.session_state.perfil = None
-
+if "memoria" not in st.session_state:
+    st.session_state.memoria = {
+        "mes_gestao": None,
+        "caixa_gestao": None,
+        "contrato_gestao": None,
+        "mes_consulta": None,
+        "mes_auditoria": None
+    }
 # -------------------------
 # AUTO LOGIN
 # -------------------------
