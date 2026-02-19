@@ -549,7 +549,20 @@ if menu == "Consultar Arquivamentos":
         # -------------------------
         # FILTRO CAIXA (OPCIONAL)
         # -------------------------
-        caixas = pd.read_sql("SELECT * FROM caixas WHERE mes_id = %s", conn, params=(mes_id,))
+        if mes_id == "Todos":
+            caixas = pd.read_sql("SELECT * FROM caixas ORDER BY id", conn)
+        else:
+            caixas = pd.read_sql("SELECT * FROM caixas WHERE mes_id = %s ORDER BY id", conn, params=(int(mes_id),))
+
+        caixa_opcoes = ["Todas"] + caixas["id"].tolist()
+
+        caixa_selecionada = st.selectbox(
+            "Caixa (opcional)",
+            caixa_opcoes,
+            format_func=lambda x: "Todas" if x == "Todas"
+            else f"Caixa {caixas.loc[caixas['id']==x,'numero_caixa'].values[0]}"
+        )
+
         
         caixa_opcoes = ["Todas"] + caixas["id"].tolist()
 
@@ -589,7 +602,7 @@ if menu == "Consultar Arquivamentos":
 
         if mes_id != "Todos":
             query += " AND cp.mes_id = %s"
-            params.append(mes_id)
+            params.append(int(mes_id))
 
 
         # Filtro Caixa
