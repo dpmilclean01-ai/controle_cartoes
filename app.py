@@ -2,6 +2,18 @@ import streamlit as st
 
 st.set_page_config(page_title="Controle de Cartões", layout="wide")
 
+# -------------------------
+# MEMÓRIA DE SESSÃO (NÃO APAGAR)
+# -------------------------
+if "memoria" not in st.session_state:
+    st.session_state.memoria = {
+        "mes_gestao": None,
+        "caixa_gestao": None,
+        "contrato_gestao": None,
+        "mes_consulta": None,
+        "mes_auditoria": None
+    }
+
 import psycopg2
 import pandas as pd
 from datetime import datetime
@@ -369,119 +381,136 @@ if menu == "Gestão de Caixas":
     # -------------------------
     # ARQUIVAR FUNCIONÁRIOS
     # -------------------------
-    with abas[2]:
+            with abas[2]:
+                st.subheader("📌 Arquivar Funcionários")
 
-        meses = pd.read_sql("SELECT * FROM meses", conn)
-        base = pd.read_sql("SELECT * FROM base_colaboradores", conn)
+                meses = pd.read_sql("SELECT * FROM meses ORDER BY id DESC", conn)
+                base = pd.read_sql("SELECT matricula, nome, contrato FROM base_colaboradores ORDER BY nome", conn)
 
-        if meses.empty or base.empty:
-            st.warning("Cadastre mês e base primeiro.")
-        else:
-            modo = st.radio(
-                "Modo de seleção",
-                ["Por contrato", "Direto por funcionário"],
-                horizontal=True
-            )
-            if modo == "Por contrato":
+                if meses.empty or base.empty:
+                    st.warning("Cadastre mês e base primeiro.")
+                    st.stop()
+
+                # -------- MÊS (OBRIGATÓRIO) --------
                 meses_ids = meses["id"].tolist()
                 index_padrao = 0
-                if st.session_state.memoria["mes_gestao"] in meses_ids:
+                if st.session_state.memoria.get("mes_gestao") in meses_ids:
                     index_padrao = meses_ids.index(st.session_state.memoria["mes_gestao"])
+
                 mes_id = st.selectbox(
                     "Mês",
                     meses_ids,
                     index=index_padrao,
-                    format_func=lambda x: meses.loc[meses["id"] == x, "mes_referencia"].values[0]
-    )
-            caixas_mes = pd.read_sql("SELECT * FROM caixas WHERE mes_id = %s", conn, params=(mes_id,))
+                    format_func=lambda x: meses.loc[meses["id"] == x, "mes_referencia"].values[0],
+                    key="mes_arquivar"
+                )
+                st.session_state.memoria["mes_gestao"] = mes_id
 
-            if caixas_mes.empty:
-                st.warning("Nenhuma caixa criada para este mês.")
-            else:
+                # -------- CAIXA (OBRIGATÓRIO) --------
+                caixas_mes = pd.read_sql(
+                    "SELECT * FROM caixas WHERE mes_id = %s ORDER BY id",
+                    conn,
+                    params=(int(mes_id),)
+                )
+
+                if caixas_mes.empty:
+                    st.warning("Nenhuma caixa criada para este mês.")
+                    st.stop()
+
                 caixas_ids = caixas_mes["id"].tolist()
                 index_caixa = 0
-                if st.session_state.memoria["caixa_gestao"] in caixas_ids:
+                if st.session_state.memoria.get("caixa_gestao") in caixas_ids:
                     index_caixa = caixas_ids.index(st.session_state.memoria["caixa_gestao"])
+
                 caixa_id = st.selectbox(
                     "Caixa",
                     caixas_ids,
                     index=index_caixa,
-                    format_func=lambda x: f"Caixa {caixas_mes.loc[caixas_mes['id']==x,'numero_caixa'].values[0]}"
+                    format_func=lambda x: f"Caixa {caixas_mes.loc[caixas_mes['id']==x,'numero_caixa'].values[0]}",
+                    key="caixa_arquivar"
                 )
                 st.session_state.memoria["caixa_gestao"] = caixa_id
 
+                st.divider()
+
+                # -------- MODO --------
+                modo = st.radio(
+                    "Modo de seleção",
+                    ["Por contrato", "Direto por funcionário"],
+                    horizontal=True,
+                    key="modo_arquivar"
+                )
+
+                # =========================
+                # MODO 1: POR CONTRATO
+                # =========================
                 if modo == "Por contrato":
                     contratos_lista = sorted(base["contrato"].dropna().unique().tolist())
-                    contrato = st.selectbox("Contrato", contratos_lista)
+                    index_contrato = 0
+                    if st.session_state.memoria.get("contrato_gestao") in contratos_lista:
+                        index_contrato = contratos_lista.index(st.session_state.memoria["contrato_gestao"])
 
-                    funcionarios = base[base["contrato"] == contrato].sort_values(by="matricula")
+                    contrato = st.selectbox("Contrato", contratos_lista, index=index_contrato, key="contrato_arquivar")
+                    st.session_state.memoria["contrato_gestao"] = contrato
+
+                    funcionarios = base[base["contrato"] == contrato].copy()
+                    funcionarios["matricula"] = funcionarios["matricula"].astype(str)
+
+                    opcoes = funcionarios["matricula"].tolist()
 
                     selecionados = st.multiselect(
-                        "Selecionar funcionários arquivados",
-                        funcionarios["matricula"].tolist(),
-                        format_func=lambda x: f"{x} - {funcionarios.loc[funcionarios['matricula']==x,'nome'].values[0]}"
+                        "Selecionar funcionários",
+                        opcoes,
+                        format_func=lambda m: f"{m} | {funcionarios.loc[funcionarios['matricula']==m,'nome'].values[0]} | {contrato}",
+                        key="multi_por_contrato"
                     )
+
+                # =========================
+                # MODO 2: DIRETO POR FUNCIONÁRIO (BUSCA)
+                # =========================
                 else:
-                    busca = st.text_input("Buscar por nome ou matrícula (mín. 3 caracteres)")
+                    termo = st.text_input("Digite parte do nome OU matrícula", key="busca_func")
 
-                    if not busca or len(busca.strip()) < 3:
-                        st.info("Digite pelo menos 3 caracteres (nome OU matrícula) para carregar a lista.")
-                        selecionados = []
+                    base2 = base.copy()
+                    base2["matricula"] = base2["matricula"].astype(str)
+
+                    if termo:
+                        termo_low = termo.lower().strip()
+                        filtrado = base2[
+                            base2["matricula"].str.lower().str.contains(termo_low, na=False) |
+                            base2["nome"].str.lower().str.contains(termo_low, na=False)
+                        ].head(200)
                     else:
-                        b = busca.strip()
+                        filtrado = base2.head(50)
 
-                        base_filtrada = base[
-                            base["nome"].fillna("").str.contains(b, case=False, na=False) |
-                            base["matricula"].fillna("").str.contains(b, case=False, na=False)
-                        ].copy()
-
-                        base_filtrada = base_filtrada.sort_values(by=["contrato", "nome", "matricula"])
-
-                        limite = 300
-                        if len(base_filtrada) > limite:
-                            st.warning(f"Muitos resultados ({len(base_filtrada)}). Mostrando apenas os primeiros {limite}. Refine a busca.")
-                            base_filtrada = base_filtrada.head(limite)
-
-                        base_filtrada["label"] = (
-                            base_filtrada["matricula"].fillna("") + " | " +
-                            base_filtrada["nome"].fillna("") + " | " +
-                            base_filtrada["contrato"].fillna("")
-                        )
-
-                        opcoes = dict(zip(base_filtrada["label"], base_filtrada["matricula"]))
-
-                        escolhidos_label = st.multiselect(
-                            "Selecione os colaboradores encontrados",
-                            options=list(opcoes.keys())
-                        )
-
-                        selecionados = [opcoes[lbl] for lbl in escolhidos_label]
-
-                    # evita travar se sua base for gigante (ex: 20k+)
-                    base_filtrada = base_filtrada.head(500)
-
-                    selecionados = st.multiselect(
-                        "Selecionar funcionários arquivados",
-                        base_filtrada["matricula"].tolist(),
-                        format_func=lambda x: (
-                            f"{x} - {base.loc[base['matricula']==x,'nome'].values[0]} "
-                            f"(Contrato: {base.loc[base['matricula']==x,'contrato'].values[0]})"
-                        )
+                    filtrado = filtrado.copy()
+                    filtrado["label"] = filtrado.apply(
+                        lambda r: f"{r['matricula']} | {r['nome']} | {r['contrato']}",
+                        axis=1
                     )
-                if st.button("Salvar Arquivamento"):
-                    registros = []
 
-                    for mat in selecionados:
-                        registros.append((
-                            mat,
-                            caixa_id,
-                            mes_id,
-                            datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-                        ))
+                    label_para_matricula = dict(zip(filtrado["label"], filtrado["matricula"]))
+
+                    labels = filtrado["label"].tolist()
+
+                    selecionados_labels = st.multiselect(
+                        "Selecione os funcionários (resultado da busca)",
+                        labels,
+                        key="multi_direto"
+                    )
+
+                    selecionados = [label_para_matricula[l] for l in selecionados_labels]
+
+                # -------- SALVAR --------
+                if st.button("Salvar Arquivamento", key="btn_salvar_arquivar"):
+                    if not selecionados:
+                        st.warning("Selecione pelo menos 1 funcionário.")
+                        st.stop()
+
+                    registros = [(mat, caixa_id, mes_id, datetime.now().strftime("%d-%m-%Y %H:%M:%S")) for mat in selecionados]
 
                     query = """
-                    INSERT INTO cartoes_ponto
-                    (matricula, caixa_id, mes_id, data_registro)
+                    INSERT INTO cartoes_ponto (matricula, caixa_id, mes_id, data_registro)
                     VALUES (%s,%s,%s,%s)
                     ON CONFLICT (matricula, mes_id) DO NOTHING
                     """
@@ -489,7 +518,7 @@ if menu == "Gestão de Caixas":
                     execute_batch(cursor, query, registros, page_size=500)
                     conn.commit()
 
-                    st.success("Processamento concluído!")
+                    st.success(f"✅ {len(registros)} matrícula(s) processada(s)!")
 
 # -------------------------
 # CONSULTAR ARQUIVAMENTOS
