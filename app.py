@@ -410,8 +410,6 @@ if menu == "Gestão de Caixas":
                 )
                 st.session_state.memoria["caixa_gestao"] = caixa_id
 
-                modo = st.radio("Modo de seleção", ["Por contrato", "Direto por funcionário"], horizontal=True)
-
                 if modo == "Por contrato":
                     contratos_lista = sorted(base["contrato"].dropna().unique().tolist())
                     contrato = st.selectbox("Contrato", contratos_lista)
