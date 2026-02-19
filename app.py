@@ -562,17 +562,6 @@ if menu == "Consultar Arquivamentos":
             format_func=lambda x: "Todas" if x == "Todas"
             else f"Caixa {caixas.loc[caixas['id']==x,'numero_caixa'].values[0]}"
         )
-
-        
-        caixa_opcoes = ["Todas"] + caixas["id"].tolist()
-
-        caixa_selecionada = st.selectbox(
-            "Caixa (opcional)",
-            caixa_opcoes,
-            format_func=lambda x: "Todas" if x == "Todas"
-            else f"Caixa {caixas.loc[caixas['id']==x,'numero_caixa'].values[0]}"
-        )
-
         # -------------------------
         # FILTRO CONTRATO (OPCIONAL)
         # -------------------------
