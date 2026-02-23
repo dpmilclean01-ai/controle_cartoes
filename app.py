@@ -472,9 +472,9 @@ if menu == "Gestão de Caixas":
 
     abas = st.tabs(["Criar Mês", "Criar Caixa", "Operações (Arquivar/Desarquivar/Excluir)"])
 
-    # -------------------------
-    # CRIAR MÊS
-    # -------------------------
+# -------------------------
+# CRIAR MÊS
+# -------------------------
 with abas[0]:
     st.subheader("📅 Criar Mês")
 
@@ -489,8 +489,10 @@ with abas[0]:
                 pool, conn, cur = get_conn_cursor()
                 cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
                 close_conn(pool, conn, cur, commit=True)
+
                 st.success("Mês criado!")
                 st.rerun()
+
             except Exception as e:
                 close_conn(pool, conn, cur, commit=False)
                 st.error(f"Mês já existe ou valor inválido. Detalhe: {e}")
