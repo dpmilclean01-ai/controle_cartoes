@@ -472,6 +472,29 @@ if menu == "Gestão de Caixas":
 
     abas = st.tabs(["Criar Mês", "Criar Caixa", "Operações (Arquivar/Desarquivar/Excluir)"])
 
+    # -------------------------
+    # CRIAR MÊS
+    # -------------------------
+    with abas[0]:
+        st.subheader("📅 Criar Mês")
+
+        mes = st.text_input("Mês referência (ex: 01-2026)", key="criar_mes_txt")
+
+        if st.button("Salvar Mês", key="criar_mes_btn"):
+            if not mes or not mes.strip():
+                st.warning("Digite o mês no formato 01-2026.")
+            else:
+                pool = conn = cur = None
+                try:
+                    pool, conn, cur = get_conn_cursor()
+                    cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
+                    close_conn(pool, conn, cur, commit=True)
+                    st.success("Mês criado!")
+                    st.rerun()
+                except Exception as e:
+                    close_conn(pool, conn, cur, commit=False)
+                    st.error(f"Mês já existe ou valor inválido. Detalhe: {e}")
+
 # -------------------------
 # CRIAR MÊS
 # -------------------------
