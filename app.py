@@ -5,6 +5,7 @@ import pandas as pd
 import psycopg2
 import streamlit as st
 from psycopg2.extras import execute_batch, execute_values
+from psycopg2.pool import ThreadedConnectionPool
 from streamlit_cookies_manager import EncryptedCookieManager
 
 # =========================================================
@@ -26,7 +27,10 @@ def formatar_data(valor):
     if v == "":
         return None
     try:
-        return pd.to_datetime(v, dayfirst=True, errors="coerce").strftime("%d-%m-%Y")
+        dt = pd.to_datetime(v, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.strftime("%d-%m-%Y")
     except Exception:
         return None
 
@@ -40,32 +44,17 @@ def registrar_log(cur, usuario, acao, detalhe):
         (usuario, acao, detalhe, agora_str()),
     )
 
+
 def registrar_logs_em_lote(cur, usuario, acao, detalhes):
     if not detalhes:
         return
-    registros = [(usuario, acao, d, agora_str()) for d in detalhes]
+    ts = agora_str()
+    registros = [(usuario, acao, d, ts) for d in detalhes]
     execute_values(
         cur,
         "INSERT INTO logs (usuario, acao, detalhe, data) VALUES %s",
         registros,
-        page_size=1000
-    )
-
-
-def buscar_colaboradores(termo, limite=150):
-    termo = (termo or "").strip()
-    if len(termo) < 2:
-        return pd.DataFrame(columns=["matricula", "nome", "contrato"])
-
-    return sql_df(
-        """
-        SELECT matricula, nome, contrato
-        FROM base_colaboradores
-        WHERE matricula ILIKE %s OR nome ILIKE %s
-        ORDER BY nome
-        LIMIT %s
-        """,
-        params=(f"%{termo}%", f"%{termo}%", limite),
+        page_size=1000,
     )
 
 
@@ -86,45 +75,43 @@ if "memoria" not in st.session_state:
     }
 
 # =========================================================
-# BANCO
+# BANCO (POOL)
 # =========================================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     st.error("DATABASE_URL não encontrada (configure nas variáveis do Streamlit Cloud).")
     st.stop()
 
-from psycopg2.pool import ThreadedConnectionPool
 
 @st.cache_resource
 def get_pool():
     return ThreadedConnectionPool(
         minconn=1,
         maxconn=10,  # se tiver muitos usuários simultâneos, suba para 20
-        dsn=DATABASE_URL
+        dsn=DATABASE_URL,
     )
+
 
 def get_conn_cursor():
     pool = get_pool()
     conn = pool.getconn()
 
-    # 🔥 IMPORTANTÍSSIMO EM POOL: limpa qualquer transação pendente/aborted
+    # limpa transação pendente/aborted
     try:
         conn.rollback()
     except Exception:
         pass
 
-    # não precisa setar autocommit, mas se quiser manter explícito:
     try:
         conn.autocommit = False
     except Exception:
-        # se por algum motivo não conseguir setar, seguimos (default já é False)
         pass
 
     cur = conn.cursor()
     return pool, conn, cur
 
+
 def close_conn(pool, conn, cur=None, commit=True):
-    # cur pode ser None (quando deu erro antes de criar cursor)
     try:
         if conn is not None:
             if commit:
@@ -142,6 +129,8 @@ def close_conn(pool, conn, cur=None, commit=True):
                 pool.putconn(conn)
         except Exception:
             pass
+
+
 def sql_df(query, params=None):
     pool = conn = cur = None
     try:
@@ -153,6 +142,7 @@ def sql_df(query, params=None):
         close_conn(pool, conn, cur, commit=False)
         raise
 
+
 def sql_exec(query, params=None):
     pool = conn = cur = None
     try:
@@ -162,6 +152,25 @@ def sql_exec(query, params=None):
     except Exception:
         close_conn(pool, conn, cur, commit=False)
         raise
+
+
+def buscar_colaboradores(termo, limite=150):
+    termo = (termo or "").strip()
+    if len(termo) < 2:
+        return pd.DataFrame(columns=["matricula", "nome", "contrato"])
+
+    return sql_df(
+        """
+        SELECT matricula, nome, contrato
+        FROM base_colaboradores
+        WHERE matricula ILIKE %s OR nome ILIKE %s
+        ORDER BY nome
+        LIMIT %s
+        """,
+        params=(f"%{termo}%", f"%{termo}%", limite),
+    )
+
+
 # =========================================================
 # COOKIES
 # =========================================================
@@ -170,122 +179,123 @@ if not cookies.ready():
     st.stop()
 
 # =========================================================
-# TABELAS / MIGRAÇÕES
+# MIGRAÇÕES / TABELAS / ÍNDICES
 # =========================================================
-pool, conn, cursor = get_conn_cursor()
-try:
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS base_colaboradores (
-        id SERIAL PRIMARY KEY,
-        matricula TEXT UNIQUE,
-        nome TEXT,
-        contrato TEXT,
-        responsavel TEXT,
-        data_admissao TEXT,
-        data_demissao TEXT,
-        sit_folha TEXT,
-        ultima_atualizacao TEXT
-    )
-    """
-    )
-
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS meses (
-        id SERIAL PRIMARY KEY,
-        mes_referencia TEXT UNIQUE
-    )
-    """
-    )
-
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS caixas (
-        id SERIAL PRIMARY KEY,
-        numero_caixa TEXT,
-        mes_id INTEGER,
-        localizacao TEXT
-    )
-    """
-    )
-
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS cartoes_ponto (
-        id SERIAL PRIMARY KEY,
-        matricula TEXT,
-        caixa_id INTEGER,
-        mes_id INTEGER,
-        data_registro TEXT,
-        UNIQUE (matricula, mes_id)
-    )
-    """
-    )
-
-    # Opção B (histórico)
-    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ARQUIVADO'")
-    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS data_desarquivamento TEXT")
-    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS usuario_desarquivou TEXT")
-    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS motivo_desarquivamento TEXT")
-
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS usuarios (
-        id SERIAL PRIMARY KEY,
-        username TEXT UNIQUE,
-        password TEXT,
-        perfil TEXT
-    )
-    """
-    )
-
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS logs (
-        id SERIAL PRIMARY KEY,
-        usuario TEXT,
-        acao TEXT,
-        detalhe TEXT,
-        data TEXT
-    )
-    """
-    )
-
-    # Índices
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_base_matricula ON base_colaboradores(matricula)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes ON cartoes_ponto(mes_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_matricula ON cartoes_ponto(matricula)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes ON caixas(mes_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes_status ON cartoes_ponto(mes_id, status)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_caixa_status ON cartoes_ponto(caixa_id, status)")
-    conn.commit()
-    
-    close_conn(pool, conn, cursor, commit=True)
-except Exception as e:
-    close_conn(pool, conn, cursor, commit=False)
-    st.error(f"Erro nas migrações/tabelas: {e}")
-    st.stop()
-
-# =========================================================
-# ADMIN PADRÃO
-# =========================================================
-pool, conn, cursor = get_conn_cursor()
-try:
-    cursor.execute("SELECT 1 FROM usuarios WHERE username=%s", ("adm",))
-    existe = cursor.fetchone()
-
-    if not existe:
-        cursor.execute(
-            "INSERT INTO usuarios (username, password, perfil) VALUES (%s,%s,%s)",
-            ("adm", "123", "admin"),
+def run_migrations():
+    pool, conn, cur = get_conn_cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS base_colaboradores (
+                id SERIAL PRIMARY KEY,
+                matricula TEXT UNIQUE,
+                nome TEXT,
+                contrato TEXT,
+                responsavel TEXT,
+                data_admissao TEXT,
+                data_demissao TEXT,
+                sit_folha TEXT,
+                ultima_atualizacao TEXT
+            )
+            """
         )
 
-    close_conn(pool, conn, cursor, commit=True)
-except Exception as e:
-    close_conn(pool, conn, cursor, commit=False)
-    st.error(f"Erro ao garantir admin padrão: {e}")
-    st.stop()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meses (
+                id SERIAL PRIMARY KEY,
+                mes_referencia TEXT UNIQUE
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS caixas (
+                id SERIAL PRIMARY KEY,
+                numero_caixa TEXT,
+                mes_id INTEGER,
+                localizacao TEXT
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cartoes_ponto (
+                id SERIAL PRIMARY KEY,
+                matricula TEXT,
+                caixa_id INTEGER,
+                mes_id INTEGER,
+                data_registro TEXT,
+                UNIQUE (matricula, mes_id)
+            )
+            """
+        )
+
+        # colunas histórico/status
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ARQUIVADO'")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS data_desarquivamento TEXT")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS usuario_desarquivou TEXT")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS motivo_desarquivamento TEXT")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE,
+                password TEXT,
+                perfil TEXT
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS logs (
+                id SERIAL PRIMARY KEY,
+                usuario TEXT,
+                acao TEXT,
+                detalhe TEXT,
+                data TEXT
+            )
+            """
+        )
+
+        # índices
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_base_matricula ON base_colaboradores(matricula)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes ON cartoes_ponto(mes_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_matricula ON cartoes_ponto(matricula)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes ON caixas(mes_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes_status ON cartoes_ponto(mes_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_caixa_status ON cartoes_ponto(caixa_id, status)")
+
+        close_conn(pool, conn, cur, commit=True)
+    except Exception as e:
+        close_conn(pool, conn, cur, commit=False)
+        st.error(f"Erro nas migrações/tabelas: {e}")
+        st.stop()
+
+
+def ensure_admin():
+    pool, conn, cur = get_conn_cursor()
+    try:
+        cur.execute("SELECT 1 FROM usuarios WHERE username=%s", ("adm",))
+        existe = cur.fetchone()
+        if not existe:
+            cur.execute(
+                "INSERT INTO usuarios (username, password, perfil) VALUES (%s,%s,%s)",
+                ("adm", "123", "admin"),
+            )
+        close_conn(pool, conn, cur, commit=True)
+    except Exception as e:
+        close_conn(pool, conn, cur, commit=False)
+        st.error(f"Erro ao garantir admin padrão: {e}")
+        st.stop()
+
+
+run_migrations()
+ensure_admin()
 
 # =========================================================
 # AUTO LOGIN
@@ -297,19 +307,14 @@ if st.session_state.usuario_logado is None:
         user_cookie = None
 
     if user_cookie:
-        pool, conn, cursor = get_conn_cursor()
         try:
-            cursor.execute("SELECT username, perfil FROM usuarios WHERE username=%s", (user_cookie,))
-            usuario = cursor.fetchone()
-            close_conn(pool, conn, cursor, commit=True)
-
-            if usuario:
-                st.session_state.usuario_logado = usuario[0]
-                st.session_state.perfil = usuario[1]
-        except Exception as e:
-            close_conn(pool, conn, cursor, commit=False)
-            # aqui não precisa parar o app; só ignora o cookie se deu erro
-            st.warning(f"Falha no auto login (cookie ignorado): {e}")
+            df_u = sql_df("SELECT username, perfil FROM usuarios WHERE username=%s", params=(user_cookie,))
+            if not df_u.empty:
+                st.session_state.usuario_logado = df_u.iloc[0]["username"]
+                st.session_state.perfil = df_u.iloc[0]["perfil"]
+        except Exception:
+            # ignora cookie se falhar
+            pass
 
 # =========================================================
 # LOGIN
@@ -322,33 +327,31 @@ if st.session_state.usuario_logado is None:
     manter = st.checkbox("Manter conectado", key="login_keep")
 
     if st.button("Entrar", key="login_btn"):
-        pool, conn, cursor = get_conn_cursor()
+        pool, conn, cur = get_conn_cursor()
         try:
-            cursor.execute(
+            cur.execute(
                 "SELECT username, perfil FROM usuarios WHERE username=%s AND password=%s",
                 (user, senha),
             )
-            usuario = cursor.fetchone()
-            close_conn(pool, conn, cursor, commit=True)
+            usuario = cur.fetchone()
+            close_conn(pool, conn, cur, commit=True)
 
             if usuario:
                 st.session_state.usuario_logado = usuario[0]
                 st.session_state.perfil = usuario[1]
-
                 if manter:
                     cookies["usuario"] = usuario[0]
                     cookies.save()
-
                 st.success("Login realizado!")
                 st.rerun()
             else:
                 st.error("Usuário ou senha inválidos.")
-
         except Exception as e:
-            close_conn(pool, conn, cursor, commit=False)
+            close_conn(pool, conn, cur, commit=False)
             st.error(f"Erro no login: {e}")
 
     st.stop()
+
 # =========================================================
 # MENU
 # =========================================================
@@ -473,56 +476,33 @@ if menu == "Gestão de Caixas":
 
     abas = st.tabs(["Criar Mês", "Criar Caixa", "Operações (Arquivar/Desarquivar/Excluir)"])
 
-# -------------------------
-# CRIAR MÊS
-# -------------------------
-with abas[0]:
-    st.subheader("📅 Criar Mês")
+    # -------------------------
+    # CRIAR MÊS
+    # -------------------------
+    with abas[0]:
+        st.subheader("📅 Criar Mês")
+        mes = st.text_input("Mês referência (ex: 01-2026)", key="criar_mes_txt")
 
-    mes = st.text_input("Mês referência (ex: 01-2026)", key="criar_mes_txt")
+        if st.button("Salvar Mês", key="criar_mes_btn"):
+            if not mes or not mes.strip():
+                st.warning("Digite o mês no formato 01-2026.")
+            else:
+                pool = conn = cur = None
+                try:
+                    pool, conn, cur = get_conn_cursor()
+                    cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
+                    close_conn(pool, conn, cur, commit=True)
+                    st.success("Mês criado!")
+                    st.rerun()
+                except Exception as e:
+                    close_conn(pool, conn, cur, commit=False)
+                    st.error(f"Mês já existe ou valor inválido. Detalhe: {e}")
 
-    if st.button("Salvar Mês", key="criar_mes_btn"):
-        if not mes or not mes.strip():
-            st.warning("Digite o mês no formato 01-2026.")
-        else:
-            pool = conn = cur = None
-            try:
-                pool, conn, cur = get_conn_cursor()
-                cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
-                close_conn(pool, conn, cur, commit=True)
-                st.success("Mês criado!")
-                st.rerun()
-            except Exception as e:
-                close_conn(pool, conn, cur, commit=False)
-                st.error(f"Mês já existe ou valor inválido. Detalhe: {e}")
-# -------------------------
-# CRIAR MÊS
-# -------------------------
-with abas[0]:
-    st.subheader("📅 Criar Mês")
-
-    mes = st.text_input("Mês referência (ex: 01-2026)", key="criar_mes_txt")
-
-    if st.button("Salvar Mês", key="criar_mes_btn"):
-        if not mes or not mes.strip():
-            st.warning("Digite o mês no formato 01-2026.")
-        else:
-            pool = conn = cur = None
-            try:
-                pool, conn, cur = get_conn_cursor()
-                cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
-                close_conn(pool, conn, cur, commit=True)
-
-                st.success("Mês criado!")
-                st.rerun()
-
-            except Exception as e:
-                close_conn(pool, conn, cur, commit=False)
-                st.error(f"Mês já existe ou valor inválido. Detalhe: {e}")
     # -------------------------
     # CRIAR CAIXA
     # -------------------------
     with abas[1]:
+        st.subheader("📦 Criar Caixa")
         meses = sql_df("SELECT * FROM meses ORDER BY id DESC")
         if meses.empty:
             st.warning("Cadastre um mês primeiro.")
@@ -555,7 +535,7 @@ with abas[0]:
                         st.error(f"Erro ao criar caixa: {e}")
 
     # -------------------------
-    # OPERAÇÕES (Arquivar/Desarquivar/Excluir)
+    # OPERAÇÕES
     # -------------------------
     with abas[2]:
         st.subheader("📌 Operações")
@@ -610,7 +590,10 @@ with abas[0]:
                 "Caixa de destino",
                 caixas_ids,
                 index=idx_caixa,
-                format_func=lambda x: f"Caixa {caixas_mes.loc[caixas_mes['id']==x,'numero_caixa'].values[0]} • {caixas_mes.loc[caixas_mes['id']==x,'localizacao'].values[0]}",
+                format_func=lambda x: (
+                    f"Caixa {caixas_mes.loc[caixas_mes['id']==x,'numero_caixa'].values[0]} • "
+                    f"{caixas_mes.loc[caixas_mes['id']==x,'localizacao'].values[0]}"
+                ),
                 key="arq_caixa",
             )
             st.session_state.memoria["caixa_gestao"] = caixa_id
@@ -653,12 +636,8 @@ with abas[0]:
                     format_func=lambda m: f"{m} | {funcionarios.loc[funcionarios['matricula']==m,'nome'].values[0]} | {contrato}",
                     key="arq_multi_contrato",
                 )
-
             else:
-                termo = st.text_input(
-                    "Digite parte do nome ou matrícula (mínimo 2 caracteres)",
-                    key="busca_func",
-                )
+                termo = st.text_input("Digite parte do nome ou matrícula (mínimo 2 caracteres)", key="busca_func")
                 df_busca = buscar_colaboradores(termo)
 
                 if len(termo.strip()) >= 2 and not df_busca.empty:
@@ -673,6 +652,7 @@ with abas[0]:
                     selecionados_matriculas = [mapa[x] for x in escolhas]
 
             st.divider()
+
             if st.button("✅ Arquivar selecionados", type="primary", key="btn_arquivar"):
                 if not selecionados_matriculas:
                     st.warning("Selecione pelo menos um colaborador.")
@@ -680,9 +660,8 @@ with abas[0]:
                     ts = agora_str()
                     usuario = st.session_state.usuario_logado
 
-                    pool, conn, cursor = get_conn_cursor()
+                    pool, conn, cur = get_conn_cursor()
                     try:
-                        # 1) grava/atualiza cartões em lote
                         registros = [(mat, int(caixa_id), int(mes_id), ts) for mat in selecionados_matriculas]
 
                         query = """
@@ -698,18 +677,16 @@ with abas[0]:
                             motivo_desarquivamento = NULL
                         """
 
-                        execute_batch(cursor, query, registros, page_size=500)
+                        execute_batch(cur, query, registros, page_size=500)
 
-                        # 2) logs em lote (1 insert gigante ao invés de for)
                         detalhes = [f"Matricula {mat} -> Caixa {caixa_id} | Mes {mes_id}" for mat in selecionados_matriculas]
-                        registrar_logs_em_lote(cursor, usuario, "ARQUIVAMENTO", detalhes)
+                        registrar_logs_em_lote(cur, usuario, "ARQUIVAMENTO", detalhes)
 
-                        close_conn(pool, conn, cursor, commit=True)
-
+                        close_conn(pool, conn, cur, commit=True)
                         st.success(f"Arquivamento concluído: {len(selecionados_matriculas)} colaborador(es).")
-
+                        st.rerun()
                     except Exception as e:
-                        close_conn(pool, conn, cursor, commit=False)
+                        close_conn(pool, conn, cur, commit=False)
                         st.error(f"Erro ao arquivar: {e}")
 
         # =========================================================
@@ -725,7 +702,7 @@ with abas[0]:
                 key="desarq_mes",
             )
 
-            df_arq = pd.read_sql(
+            df_arq = sql_df(
                 """
                 SELECT cp.id, cp.matricula, b.nome, b.contrato
                 FROM cartoes_ponto cp
@@ -733,7 +710,6 @@ with abas[0]:
                 WHERE cp.mes_id = %s AND cp.status = 'ARQUIVADO'
                 ORDER BY b.nome
                 """,
-                conn,
                 params=(int(mes_id),),
             )
 
@@ -760,13 +736,11 @@ with abas[0]:
                     ts = agora_str()
                     usuario = st.session_state.usuario_logado
                     motivo_ok = motivo.strip()
-
                     ids = [mapa[x] for x in escolhidos]
 
-                    pool, conn, cursor = get_conn_cursor()
+                    pool, conn, cur = get_conn_cursor()
                     try:
-                        # 1) desarquiva em lote
-                        cursor.execute(
+                        cur.execute(
                             """
                             UPDATE cartoes_ponto
                             SET status='DESARQUIVADO',
@@ -778,16 +752,14 @@ with abas[0]:
                             (ts, usuario, motivo_ok, ids),
                         )
 
-                        # 2) logs em lote
                         detalhes = [f"Registro {rid} | Motivo: {motivo_ok}" for rid in ids]
-                        registrar_logs_em_lote(cursor, usuario, "DESARQUIVAMENTO", detalhes)
+                        registrar_logs_em_lote(cur, usuario, "DESARQUIVAMENTO", detalhes)
 
-                        close_conn(pool, conn, cursor, commit=True)
-
+                        close_conn(pool, conn, cur, commit=True)
                         st.success(f"Desarquivamento concluído: {len(ids)} registro(s).")
-
+                        st.rerun()
                     except Exception as e:
-                        close_conn(pool, conn, cursor, commit=False)
+                        close_conn(pool, conn, cur, commit=False)
                         st.error(f"Erro ao desarquivar: {e}")
 
         # =========================================================
@@ -803,9 +775,8 @@ with abas[0]:
                 key="exc_caixa_mes",
             )
 
-            caixas_mes = pd.read_sql(
+            caixas_mes = sql_df(
                 "SELECT * FROM caixas WHERE mes_id=%s ORDER BY numero_caixa",
-                conn,
                 params=(int(mes_id),),
             )
 
@@ -816,11 +787,14 @@ with abas[0]:
             caixa_id = st.selectbox(
                 "Selecione a caixa para excluir",
                 caixas_mes["id"].tolist(),
-                format_func=lambda x: f"Caixa {caixas_mes.loc[caixas_mes['id']==x,'numero_caixa'].values[0]} • {caixas_mes.loc[caixas_mes['id']==x,'localizacao'].values[0]}",
+                format_func=lambda x: (
+                    f"Caixa {caixas_mes.loc[caixas_mes['id']==x,'numero_caixa'].values[0]} • "
+                    f"{caixas_mes.loc[caixas_mes['id']==x,'localizacao'].values[0]}"
+                ),
                 key="exc_caixa_id",
             )
 
-            impacto = pd.read_sql(
+            impacto = sql_df(
                 """
                 SELECT cp.id, cp.matricula, b.nome, b.contrato
                 FROM cartoes_ponto cp
@@ -828,7 +802,6 @@ with abas[0]:
                 WHERE cp.caixa_id = %s AND cp.status = 'ARQUIVADO'
                 ORDER BY b.nome
                 """,
-                conn,
                 params=(int(caixa_id),),
             )
 
@@ -837,42 +810,44 @@ with abas[0]:
 
             motivo = st.text_input("Motivo da exclusão (obrigatório)", key="motivo_exc_caixa")
 
-            pool = conn = cur = None
-            try:
-                pool, conn, cur = get_conn_cursor()
+            if st.button("❌ Confirmar exclusão da caixa", type="primary", key="btn_exc_caixa"):
+                if len(motivo.strip()) < 3:
+                    st.warning("Informe um motivo (mínimo 3 caracteres).")
+                else:
+                    pool, conn, cur = get_conn_cursor()
+                    try:
+                        cur.execute(
+                            """
+                            UPDATE cartoes_ponto
+                            SET status='DESARQUIVADO',
+                                data_desarquivamento=%s,
+                                usuario_desarquivou=%s,
+                                motivo_desarquivamento=%s
+                            WHERE caixa_id=%s AND status='ARQUIVADO'
+                            """,
+                            (
+                                agora_str(),
+                                st.session_state.usuario_logado,
+                                f"Exclusão da caixa {caixa_id}: {motivo.strip()}",
+                                int(caixa_id),
+                            ),
+                        )
 
-                cur.execute(
-                    """
-                    UPDATE cartoes_ponto
-                    SET status='DESARQUIVADO',
-                        data_desarquivamento=%s,
-                        usuario_desarquivou=%s,
-                        motivo_desarquivamento=%s
-                    WHERE caixa_id=%s AND status='ARQUIVADO'
-                    """,
-                    (
-                        agora_str(),
-                        st.session_state.usuario_logado,
-                        f"Exclusão da caixa {caixa_id}: {motivo.strip()}",
-                        int(caixa_id),
-                    ),
-                )
+                        cur.execute("DELETE FROM caixas WHERE id=%s", (int(caixa_id),))
 
-                cur.execute("DELETE FROM caixas WHERE id=%s", (int(caixa_id),))
+                        registrar_log(
+                            cur,
+                            st.session_state.usuario_logado,
+                            "EXCLUSAO_CAIXA",
+                            f"Caixa {caixa_id} excluída | Mes {mes_id} | Motivo: {motivo.strip()}",
+                        )
 
-                registrar_log(
-                    cur,
-                    st.session_state.usuario_logado,
-                    "EXCLUSAO_CAIXA",
-                    f"Caixa {caixa_id} excluída | Mes {mes_id} | Motivo: {motivo.strip()}",
-                )
-
-                close_conn(pool, conn, cur, commit=True)
-                st.success("Caixa excluída com sucesso.")
-
-            except Exception as e:
-                close_conn(pool, conn, cur, commit=False)
-                st.error(f"Erro ao excluir caixa: {e}")
+                        close_conn(pool, conn, cur, commit=True)
+                        st.success("Caixa excluída com sucesso (e registros desarquivados).")
+                        st.rerun()
+                    except Exception as e:
+                        close_conn(pool, conn, cur, commit=False)
+                        st.error(f"Erro ao excluir caixa: {e}")
 
         # =========================================================
         # 4) EXCLUIR MÊS
@@ -887,7 +862,7 @@ with abas[0]:
                 key="exc_mes_id",
             )
 
-            impacto_mes = pd.read_sql(
+            impacto_mes = sql_df(
                 """
                 SELECT cp.id, cp.matricula, b.nome, b.contrato, cp.caixa_id
                 FROM cartoes_ponto cp
@@ -895,13 +870,11 @@ with abas[0]:
                 WHERE cp.mes_id = %s AND cp.status = 'ARQUIVADO'
                 ORDER BY b.nome
                 """,
-                conn,
                 params=(int(mes_id),),
             )
 
-            qtd_caixas = pd.read_sql(
+            qtd_caixas = sql_df(
                 "SELECT COUNT(*) AS total FROM caixas WHERE mes_id=%s",
-                conn,
                 params=(int(mes_id),),
             )["total"].iloc[0]
 
@@ -915,10 +888,8 @@ with abas[0]:
                 if len(motivo.strip()) < 3:
                     st.warning("Informe um motivo (mínimo 3 caracteres).")
                 else:
-                    pool = conn = cur = None
+                    pool, conn, cur = get_conn_cursor()
                     try:
-                        pool, conn, cur = get_conn_cursor()
-
                         cur.execute(
                             """
                             UPDATE cartoes_ponto
@@ -949,10 +920,10 @@ with abas[0]:
                         close_conn(pool, conn, cur, commit=True)
                         st.success("Mês excluído com sucesso (registros desarquivados e caixas removidas).")
                         st.rerun()
-
                     except Exception as e:
                         close_conn(pool, conn, cur, commit=False)
                         st.error(f"Erro ao excluir mês: {e}")
+
 # =========================================================
 # CONSULTAR ARQUIVAMENTOS
 # =========================================================
@@ -969,9 +940,7 @@ if menu == "Consultar Arquivamentos":
         "Mês",
         mes_opcoes,
         key="cons_mes",
-        format_func=lambda x: "Todos"
-        if x == "Todos"
-        else meses.loc[meses["id"] == x, "mes_referencia"].values[0],
+        format_func=lambda x: "Todos" if x == "Todos" else meses.loc[meses["id"] == x, "mes_referencia"].values[0],
     )
 
     base = sql_df("SELECT matricula, nome, contrato FROM base_colaboradores")
@@ -1033,9 +1002,8 @@ if menu == "Consultar Arquivamentos":
         registro_id = st.selectbox("Selecionar ID para excluir", df["id"].tolist(), key="cons_del_id")
 
         if st.button("Excluir Registro", key="cons_del_btn"):
-            pool = conn = cur = None
+            pool, conn, cur = get_conn_cursor()
             try:
-                pool, conn, cur = get_conn_cursor()
                 cur.execute("DELETE FROM cartoes_ponto WHERE id=%s", (int(registro_id),))
                 registrar_log(cur, st.session_state.usuario_logado, "EXCLUSAO_REGISTRO", f"Registro ID {registro_id}")
                 close_conn(pool, conn, cur, commit=True)
@@ -1046,13 +1014,13 @@ if menu == "Consultar Arquivamentos":
                 st.error(f"Erro ao excluir registro: {e}")
 
 # =========================================================
-# AUDITORIA (simples)
+# AUDITORIA (16 a 15)
 # =========================================================
 if menu == "Auditoria":
     st.header("🧠 Auditoria de Cartões")
 
-    meses = pd.read_sql("SELECT * FROM meses ORDER BY id DESC", conn)
-    base = pd.read_sql("SELECT * FROM base_colaboradores", conn)
+    meses = sql_df("SELECT * FROM meses ORDER BY id DESC")
+    base = sql_df("SELECT * FROM base_colaboradores")
 
     if meses.empty:
         st.warning("Cadastre meses primeiro.")
@@ -1072,10 +1040,7 @@ if menu == "Auditoria":
     )
     st.session_state.memoria["mes_auditoria"] = mes_id
 
-    mes_ref = meses.loc[meses["id"] == mes_id, "mes_referencia"].values[0]
-
-    # aceita "01-2026" ou "01/2026"
-    mes_ref = mes_ref.replace("-", "/")
+    mes_ref = meses.loc[meses["id"] == mes_id, "mes_referencia"].values[0].replace("-", "/")
     try:
         mes, ano = mes_ref.split("/")
         mes = int(mes)
@@ -1112,9 +1077,8 @@ if menu == "Auditoria":
 
     total_deveriam = len(ativos)
 
-    arquivados = pd.read_sql(
+    arquivados = sql_df(
         "SELECT matricula FROM cartoes_ponto WHERE mes_id=%s AND status='ARQUIVADO'",
-        conn,
         params=(int(mes_id),),
     )
     arquivados_set = set(arquivados["matricula"].astype(str))
@@ -1155,9 +1119,8 @@ if menu == "Gestão de Usuários":
         perfil = st.selectbox("Perfil", ["admin", "usuario"], key="usr_role")
 
         if st.button("Criar Usuário", key="usr_create"):
-            pool = conn = cur = None
+            pool, conn, cur = get_conn_cursor()
             try:
-                pool, conn, cur = get_conn_cursor()
                 cur.execute(
                     "INSERT INTO usuarios (username, password, perfil) VALUES (%s,%s,%s)",
                     (novo_user.strip(), nova_senha, perfil),
@@ -1173,18 +1136,18 @@ if menu == "Gestão de Usuários":
                 st.error(f"Erro ao criar usuário: {e}")
 
     with abas_u[1]:
-        df_users = pd.read_sql("SELECT id, username, perfil FROM usuarios ORDER BY id", conn)
+        df_users = sql_df("SELECT id, username, perfil FROM usuarios ORDER BY id")
         st.dataframe(df_users, use_container_width=True)
 
-        user_id = st.selectbox("Selecionar usuário para excluir", df_users["id"].tolist(), key="usr_del_id")
-        if st.button("Excluir Usuário", key="usr_del_btn"):
-            pool = conn = cur = None
-            try:
+        if not df_users.empty:
+            user_id = st.selectbox("Selecionar usuário para excluir", df_users["id"].tolist(), key="usr_del_id")
+            if st.button("Excluir Usuário", key="usr_del_btn"):
                 pool, conn, cur = get_conn_cursor()
-                cur.execute("DELETE FROM usuarios WHERE id=%s", (int(user_id),))
-                close_conn(pool, conn, cur, commit=True)
-                st.success("Usuário excluído!")
-                st.rerun()
-            except Exception as e:
-                close_conn(pool, conn, cur, commit=False)
-                st.error(f"Erro ao excluir usuário: {e}")
+                try:
+                    cur.execute("DELETE FROM usuarios WHERE id=%s", (int(user_id),))
+                    close_conn(pool, conn, cur, commit=True)
+                    st.success("Usuário excluído!")
+                    st.rerun()
+                except Exception as e:
+                    close_conn(pool, conn, cur, commit=False)
+                    st.error(f"Erro ao excluir usuário: {e}")
