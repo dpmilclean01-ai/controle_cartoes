@@ -52,12 +52,12 @@ def registrar_logs_em_lote(cur, usuario, acao, detalhes):
     )
 
 
-def buscar_colaboradores(conn, termo, limite=150):
+def buscar_colaboradores(termo, limite=150):
     termo = (termo or "").strip()
     if len(termo) < 2:
         return pd.DataFrame(columns=["matricula", "nome", "contrato"])
 
-    return pd.read_sql(
+    return sql_df(
         """
         SELECT matricula, nome, contrato
         FROM base_colaboradores
@@ -65,7 +65,6 @@ def buscar_colaboradores(conn, termo, limite=150):
         ORDER BY nome
         LIMIT %s
         """,
-        conn,
         params=(f"%{termo}%", f"%{termo}%", limite),
     )
 
@@ -442,7 +441,7 @@ if menu == "Importar Base Excel":
 # =========================================================
 if menu == "Visualizar Base":
     st.header("📋 Base Atual no Sistema")
-    df = pd.read_sql("SELECT * FROM base_colaboradores ORDER BY id DESC", conn)
+    df = sql_df("SELECT * FROM base_colaboradores ORDER BY id DESC")
     if df.empty:
         st.warning("Nenhum registro encontrado.")
     else:
@@ -484,7 +483,7 @@ if menu == "Gestão de Caixas":
     # CRIAR CAIXA
     # -------------------------
     with abas[1]:
-        meses = pd.read_sql("SELECT * FROM meses ORDER BY id DESC", conn)
+        meses = sql_df("SELECT * FROM meses ORDER BY id DESC")
         if meses.empty:
             st.warning("Cadastre um mês primeiro.")
         else:
@@ -521,7 +520,7 @@ if menu == "Gestão de Caixas":
     with abas[2]:
         st.subheader("📌 Operações")
 
-        meses = pd.read_sql("SELECT * FROM meses ORDER BY id DESC", conn)
+        meses = sql_df("SELECT * FROM meses ORDER BY id DESC")
         if meses.empty:
             st.warning("Cadastre um mês primeiro.")
             st.stop()
@@ -554,9 +553,8 @@ if menu == "Gestão de Caixas":
             )
             st.session_state.memoria["mes_gestao"] = mes_id
 
-            caixas_mes = pd.read_sql(
+            caixas_mes = sql_df(
                 "SELECT * FROM caixas WHERE mes_id=%s ORDER BY numero_caixa",
-                conn,
                 params=(int(mes_id),),
             )
             if caixas_mes.empty:
@@ -586,7 +584,7 @@ if menu == "Gestão de Caixas":
                 key="modo_selecao_arq",
             )
 
-            base = pd.read_sql("SELECT matricula, nome, contrato FROM base_colaboradores", conn)
+            base = sql_df("SELECT matricula, nome, contrato FROM base_colaboradores")
             if base.empty:
                 st.warning("Base de colaboradores vazia. Importe a base primeiro.")
                 st.stop()
