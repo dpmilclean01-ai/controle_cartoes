@@ -31,13 +31,24 @@ def formatar_data(valor):
         return None
 
 
-def registrar_log(cursor, usuario, acao, detalhe):
-    cursor.execute(
+def registrar_log(cur, usuario, acao, detalhe):
+    cur.execute(
         """
         INSERT INTO logs (usuario, acao, detalhe, data)
         VALUES (%s,%s,%s,%s)
         """,
         (usuario, acao, detalhe, agora_str()),
+    )
+
+def registrar_logs_em_lote(cur, usuario, acao, detalhes):
+    if not detalhes:
+        return
+    registros = [(usuario, acao, d, agora_str()) for d in detalhes]
+    execute_values(
+        cur,
+        "INSERT INTO logs (usuario, acao, detalhe, data) VALUES %s",
+        registros,
+        page_size=1000
     )
 
 
@@ -83,9 +94,35 @@ if not DATABASE_URL:
     st.error("DATABASE_URL não encontrada (configure nas variáveis do Streamlit Cloud).")
     st.stop()
 
-conn = psycopg2.connect(DATABASE_URL)
-cursor = conn.cursor()
+from psycopg2.pool import ThreadedConnectionPool
 
+@st.cache_resource
+def get_pool():
+    return ThreadedConnectionPool(
+        minconn=1,
+        maxconn=10,  # se tiver muitos usuários simultâneos, suba para 20
+        dsn=DATABASE_URL
+    )
+
+def get_conn_cursor():
+    pool = get_pool()
+    conn = pool.getconn()
+    conn.autocommit = False
+    cur = conn.cursor()
+    return pool, conn, cur
+
+def close_conn(pool, conn, cur, commit=True):
+    try:
+        if commit:
+            conn.commit()
+        else:
+            conn.rollback()
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        pool.putconn(conn)
 # =========================================================
 # COOKIES
 # =========================================================
@@ -96,103 +133,120 @@ if not cookies.ready():
 # =========================================================
 # TABELAS / MIGRAÇÕES
 # =========================================================
-cursor.execute(
+pool, conn, cursor = get_conn_cursor()
+try:
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS base_colaboradores (
+        id SERIAL PRIMARY KEY,
+        matricula TEXT UNIQUE,
+        nome TEXT,
+        contrato TEXT,
+        responsavel TEXT,
+        data_admissao TEXT,
+        data_demissao TEXT,
+        sit_folha TEXT,
+        ultima_atualizacao TEXT
+    )
     """
-CREATE TABLE IF NOT EXISTS base_colaboradores (
-    id SERIAL PRIMARY KEY,
-    matricula TEXT UNIQUE,
-    nome TEXT,
-    contrato TEXT,
-    responsavel TEXT,
-    data_admissao TEXT,
-    data_demissao TEXT,
-    sit_folha TEXT,
-    ultima_atualizacao TEXT
-)
-"""
-)
+    )
 
-cursor.execute(
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS meses (
+        id SERIAL PRIMARY KEY,
+        mes_referencia TEXT UNIQUE
+    )
     """
-CREATE TABLE IF NOT EXISTS meses (
-    id SERIAL PRIMARY KEY,
-    mes_referencia TEXT UNIQUE
-)
-"""
-)
+    )
 
-cursor.execute(
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS caixas (
+        id SERIAL PRIMARY KEY,
+        numero_caixa TEXT,
+        mes_id INTEGER,
+        localizacao TEXT
+    )
     """
-CREATE TABLE IF NOT EXISTS caixas (
-    id SERIAL PRIMARY KEY,
-    numero_caixa TEXT,
-    mes_id INTEGER,
-    localizacao TEXT
-)
-"""
-)
+    )
 
-cursor.execute(
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS cartoes_ponto (
+        id SERIAL PRIMARY KEY,
+        matricula TEXT,
+        caixa_id INTEGER,
+        mes_id INTEGER,
+        data_registro TEXT,
+        UNIQUE (matricula, mes_id)
+    )
     """
-CREATE TABLE IF NOT EXISTS cartoes_ponto (
-    id SERIAL PRIMARY KEY,
-    matricula TEXT,
-    caixa_id INTEGER,
-    mes_id INTEGER,
-    data_registro TEXT,
-    UNIQUE (matricula, mes_id)
-)
-"""
-)
+    )
 
-# Opção B (histórico)
-cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ARQUIVADO'")
-cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS data_desarquivamento TEXT")
-cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS usuario_desarquivou TEXT")
-cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS motivo_desarquivamento TEXT")
+    # Opção B (histórico)
+    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ARQUIVADO'")
+    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS data_desarquivamento TEXT")
+    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS usuario_desarquivou TEXT")
+    cursor.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS motivo_desarquivamento TEXT")
 
-cursor.execute(
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE,
+        password TEXT,
+        perfil TEXT
+    )
     """
-CREATE TABLE IF NOT EXISTS usuarios (
-    id SERIAL PRIMARY KEY,
-    username TEXT UNIQUE,
-    password TEXT,
-    perfil TEXT
-)
-"""
-)
+    )
 
-cursor.execute(
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS logs (
+        id SERIAL PRIMARY KEY,
+        usuario TEXT,
+        acao TEXT,
+        detalhe TEXT,
+        data TEXT
+    )
     """
-CREATE TABLE IF NOT EXISTS logs (
-    id SERIAL PRIMARY KEY,
-    usuario TEXT,
-    acao TEXT,
-    detalhe TEXT,
-    data TEXT
-)
-"""
-)
+    )
 
-# Índices
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_base_matricula ON base_colaboradores(matricula)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes ON cartoes_ponto(mes_id)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_matricula ON cartoes_ponto(matricula)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes ON caixas(mes_id)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes_status ON cartoes_ponto(mes_id, status)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_caixa_status ON cartoes_ponto(caixa_id, status)")
-conn.commit()
+    # Índices
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_base_matricula ON base_colaboradores(matricula)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes ON cartoes_ponto(mes_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_matricula ON cartoes_ponto(matricula)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes ON caixas(mes_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes_status ON cartoes_ponto(mes_id, status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_caixa_status ON cartoes_ponto(caixa_id, status)")
+    conn.commit()
+    
+    close_conn(pool, conn, cursor, commit=True)
+except Exception as e:
+    close_conn(pool, conn, cursor, commit=False)
+    st.error(f"Erro nas migrações/tabelas: {e}")
+    st.stop()
 
 # =========================================================
 # ADMIN PADRÃO
 # =========================================================
-cursor.execute("SELECT 1 FROM usuarios WHERE username=%s", ("adm",))
-if not cursor.fetchone():
-    cursor.execute(
-        "INSERT INTO usuarios (username, password, perfil) VALUES (%s,%s,%s)",
-        ("adm", "123", "admin"),
-    )
-    conn.commit()
+pool, conn, cursor = get_conn_cursor()
+try:
+    cursor.execute("SELECT 1 FROM usuarios WHERE username=%s", ("adm",))
+    existe = cursor.fetchone()
+
+    if not existe:
+        cursor.execute(
+            "INSERT INTO usuarios (username, password, perfil) VALUES (%s,%s,%s)",
+            ("adm", "123", "admin"),
+        )
+
+    close_conn(pool, conn, cursor, commit=True)
+except Exception as e:
+    close_conn(pool, conn, cursor, commit=False)
+    st.error(f"Erro ao garantir admin padrão: {e}")
+    st.stop()
 
 # =========================================================
 # AUTO LOGIN
@@ -204,11 +258,19 @@ if st.session_state.usuario_logado is None:
         user_cookie = None
 
     if user_cookie:
-        cursor.execute("SELECT * FROM usuarios WHERE username=%s", (user_cookie,))
-        usuario = cursor.fetchone()
-        if usuario:
-            st.session_state.usuario_logado = usuario[1]
-            st.session_state.perfil = usuario[3]
+        pool, conn, cursor = get_conn_cursor()
+        try:
+            cursor.execute("SELECT username, perfil FROM usuarios WHERE username=%s", (user_cookie,))
+            usuario = cursor.fetchone()
+            close_conn(pool, conn, cursor, commit=True)
+
+            if usuario:
+                st.session_state.usuario_logado = usuario[0]
+                st.session_state.perfil = usuario[1]
+        except Exception as e:
+            close_conn(pool, conn, cursor, commit=False)
+            # aqui não precisa parar o app; só ignora o cookie se deu erro
+            st.warning(f"Falha no auto login (cookie ignorado): {e}")
 
 # =========================================================
 # LOGIN
@@ -221,24 +283,33 @@ if st.session_state.usuario_logado is None:
     manter = st.checkbox("Manter conectado", key="login_keep")
 
     if st.button("Entrar", key="login_btn"):
-        cursor.execute(
-            "SELECT * FROM usuarios WHERE username=%s AND password=%s",
-            (user, senha),
-        )
-        usuario = cursor.fetchone()
-        if usuario:
-            st.session_state.usuario_logado = usuario[1]
-            st.session_state.perfil = usuario[3]
-            if manter:
-                cookies["usuario"] = usuario[1]
-                cookies.save()
-            st.success("Login realizado!")
-            st.rerun()
-        else:
-            st.error("Usuário ou senha inválidos.")
+        pool, conn, cursor = get_conn_cursor()
+        try:
+            cursor.execute(
+                "SELECT username, perfil FROM usuarios WHERE username=%s AND password=%s",
+                (user, senha),
+            )
+            usuario = cursor.fetchone()
+            close_conn(pool, conn, cursor, commit=True)
+
+            if usuario:
+                st.session_state.usuario_logado = usuario[0]
+                st.session_state.perfil = usuario[1]
+
+                if manter:
+                    cookies["usuario"] = usuario[0]
+                    cookies.save()
+
+                st.success("Login realizado!")
+                st.rerun()
+            else:
+                st.error("Usuário ou senha inválidos.")
+
+        except Exception as e:
+            close_conn(pool, conn, cursor, commit=False)
+            st.error(f"Erro no login: {e}")
 
     st.stop()
-
 # =========================================================
 # MENU
 # =========================================================
@@ -524,33 +595,40 @@ if menu == "Gestão de Caixas":
                 if not selecionados_matriculas:
                     st.warning("Selecione pelo menos um colaborador.")
                 else:
-                    registros = [(mat, int(caixa_id), int(mes_id), agora_str()) for mat in selecionados_matriculas]
+                    ts = agora_str()
+                    usuario = st.session_state.usuario_logado
 
-                    query = """
-                    INSERT INTO cartoes_ponto (matricula, caixa_id, mes_id, data_registro, status)
-                    VALUES (%s,%s,%s,%s,'ARQUIVADO')
-                    ON CONFLICT (matricula, mes_id)
-                    DO UPDATE SET
-                        caixa_id = EXCLUDED.caixa_id,
-                        data_registro = EXCLUDED.data_registro,
-                        status = 'ARQUIVADO',
-                        data_desarquivamento = NULL,
-                        usuario_desarquivou = NULL,
-                        motivo_desarquivamento = NULL
-                    """
+                    pool, conn, cursor = get_conn_cursor()
+                    try:
+                        # 1) grava/atualiza cartões em lote
+                        registros = [(mat, int(caixa_id), int(mes_id), ts) for mat in selecionados_matriculas]
 
-                    execute_batch(cursor, query, registros, page_size=500)
+                        query = """
+                        INSERT INTO cartoes_ponto (matricula, caixa_id, mes_id, data_registro, status)
+                        VALUES (%s,%s,%s,%s,'ARQUIVADO')
+                        ON CONFLICT (matricula, mes_id)
+                        DO UPDATE SET
+                            caixa_id = EXCLUDED.caixa_id,
+                            data_registro = EXCLUDED.data_registro,
+                            status = 'ARQUIVADO',
+                            data_desarquivamento = NULL,
+                            usuario_desarquivou = NULL,
+                            motivo_desarquivamento = NULL
+                        """
 
-                    for mat in selecionados_matriculas:
-                        registrar_log(
-                            cursor,
-                            st.session_state.usuario_logado,
-                            "ARQUIVAMENTO",
-                            f"Matricula {mat} -> Caixa {caixa_id} | Mes {mes_id}",
-                        )
+                        execute_batch(cursor, query, registros, page_size=500)
 
-                    conn.commit()
-                    st.success(f"Arquivamento concluído: {len(selecionados_matriculas)} colaborador(es).")
+                        # 2) logs em lote (1 insert gigante ao invés de for)
+                        detalhes = [f"Matricula {mat} -> Caixa {caixa_id} | Mes {mes_id}" for mat in selecionados_matriculas]
+                        registrar_logs_em_lote(cursor, usuario, "ARQUIVAMENTO", detalhes)
+
+                        close_conn(pool, conn, cursor, commit=True)
+
+                        st.success(f"Arquivamento concluído: {len(selecionados_matriculas)} colaborador(es).")
+
+                    except Exception as e:
+                        close_conn(pool, conn, cursor, commit=False)
+                        st.error(f"Erro ao arquivar: {e}")
 
         # =========================================================
         # 2) DESARQUIVAR
@@ -597,29 +675,38 @@ if menu == "Gestão de Caixas":
                 elif len(motivo.strip()) < 3:
                     st.warning("Informe um motivo (mínimo 3 caracteres).")
                 else:
-                    ids = [mapa[x] for x in escolhidos]
-                    cursor.execute(
-                        """
-                        UPDATE cartoes_ponto
-                        SET status='DESARQUIVADO',
-                            data_desarquivamento=%s,
-                            usuario_desarquivou=%s,
-                            motivo_desarquivamento=%s
-                        WHERE id = ANY(%s)
-                        """,
-                        (agora_str(), st.session_state.usuario_logado, motivo.strip(), ids),
-                    )
+                    ts = agora_str()
+                    usuario = st.session_state.usuario_logado
+                    motivo_ok = motivo.strip()
 
-                    for rid in ids:
-                        registrar_log(
-                            cursor,
-                            st.session_state.usuario_logado,
-                            "DESARQUIVAMENTO",
-                            f"Registro {rid} | Motivo: {motivo.strip()}",
+                    ids = [mapa[x] for x in escolhidos]
+
+                    pool, conn, cursor = get_conn_cursor()
+                    try:
+                        # 1) desarquiva em lote
+                        cursor.execute(
+                            """
+                            UPDATE cartoes_ponto
+                            SET status='DESARQUIVADO',
+                                data_desarquivamento=%s,
+                                usuario_desarquivou=%s,
+                                motivo_desarquivamento=%s
+                            WHERE id = ANY(%s)
+                            """,
+                            (ts, usuario, motivo_ok, ids),
                         )
 
-                    conn.commit()
-                    st.success(f"Desarquivamento concluído: {len(ids)} registro(s).")
+                        # 2) logs em lote
+                        detalhes = [f"Registro {rid} | Motivo: {motivo_ok}" for rid in ids]
+                        registrar_logs_em_lote(cursor, usuario, "DESARQUIVAMENTO", detalhes)
+
+                        close_conn(pool, conn, cursor, commit=True)
+
+                        st.success(f"Desarquivamento concluído: {len(ids)} registro(s).")
+
+                    except Exception as e:
+                        close_conn(pool, conn, cursor, commit=False)
+                        st.error(f"Erro ao desarquivar: {e}")
 
         # =========================================================
         # 3) EXCLUIR CAIXA
@@ -793,7 +880,14 @@ if menu == "Consultar Arquivamentos":
         else meses.loc[meses["id"] == x, "mes_referencia"].values[0],
     )
 
+    pool, conn, cur = get_conn_cursor()
+try:
     base = pd.read_sql("SELECT matricula, nome, contrato FROM base_colaboradores", conn)
+    close_conn(pool, conn, cur, commit=True)
+except Exception as e:
+    close_conn(pool, conn, cur, commit=False)
+    st.error(f"Erro ao carregar base: {e}")
+    st.stop()
     contratos = ["Todos"] + sorted(base["contrato"].dropna().unique().tolist())
     contrato_selecionado = st.selectbox("Contrato (opcional)", contratos, key="cons_contrato")
 
