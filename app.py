@@ -434,8 +434,6 @@ if menu == "Importar Base Excel":
             close_conn(pool, conn, cur, commit=False)
             st.error(f"Erro na importação: {e}")
 
-        st.success(f"✅ Importação concluída: {len(registros)} registro(s) processado(s).")
-
 # =========================================================
 # VISUALIZAR BASE
 # =========================================================
@@ -619,7 +617,7 @@ if menu == "Gestão de Caixas":
                     "Digite parte do nome ou matrícula (mínimo 2 caracteres)",
                     key="busca_func",
                 )
-                df_busca = buscar_colaboradores(conn, termo)
+                df_busca = buscar_colaboradores(termo)
 
                 if len(termo.strip()) >= 2 and not df_busca.empty:
                     opcoes = []
@@ -913,14 +911,13 @@ if menu == "Gestão de Caixas":
                     except Exception as e:
                         close_conn(pool, conn, cur, commit=False)
                         st.error(f"Erro ao excluir mês: {e}")
-
 # =========================================================
 # CONSULTAR ARQUIVAMENTOS
 # =========================================================
 if menu == "Consultar Arquivamentos":
     st.header("📋 Consultar Arquivamentos")
 
-    meses = pd.read_sql("SELECT * FROM meses ORDER BY id DESC", conn)
+    meses = sql_df("SELECT * FROM meses ORDER BY id DESC")
     if meses.empty:
         st.warning("Nenhum mês cadastrado.")
         st.stop()
@@ -935,30 +932,21 @@ if menu == "Consultar Arquivamentos":
         else meses.loc[meses["id"] == x, "mes_referencia"].values[0],
     )
 
-    pool, conn, cur = get_conn_cursor()
-try:
-    base = pd.read_sql("SELECT matricula, nome, contrato FROM base_colaboradores", conn)
-    close_conn(pool, conn, cur, commit=True)
-except Exception as e:
-    close_conn(pool, conn, cur, commit=False)
-    st.error(f"Erro ao carregar base: {e}")
-    st.stop()
+    base = sql_df("SELECT matricula, nome, contrato FROM base_colaboradores")
     contratos = ["Todos"] + sorted(base["contrato"].dropna().unique().tolist())
     contrato_selecionado = st.selectbox("Contrato (opcional)", contratos, key="cons_contrato")
 
     if mes_id == "Todos":
-        caixas = pd.read_sql("SELECT * FROM caixas ORDER BY id", conn)
+        caixas = sql_df("SELECT * FROM caixas ORDER BY id")
     else:
-        caixas = pd.read_sql("SELECT * FROM caixas WHERE mes_id=%s ORDER BY id", conn, params=(int(mes_id),))
+        caixas = sql_df("SELECT * FROM caixas WHERE mes_id=%s ORDER BY id", params=(int(mes_id),))
 
     caixa_opcoes = ["Todas"] + caixas["id"].tolist()
     caixa_selecionada = st.selectbox(
         "Caixa (opcional)",
         caixa_opcoes,
         key="cons_caixa",
-        format_func=lambda x: "Todas"
-        if x == "Todas"
-        else f"Caixa {caixas.loc[caixas['id']==x,'numero_caixa'].values[0]}",
+        format_func=lambda x: "Todas" if x == "Todas" else f"Caixa {caixas.loc[caixas['id']==x,'numero_caixa'].values[0]}",
     )
 
     busca = st.text_input("Buscar por nome ou matrícula", key="cons_busca")
@@ -985,7 +973,7 @@ except Exception as e:
         query += " AND b.contrato=%s"
         params.append(contrato_selecionado)
 
-    df = pd.read_sql(query, conn, params=params)
+    df = sql_df(query, params=tuple(params) if params else None)
 
     if busca:
         df = df[
@@ -1009,7 +997,6 @@ except Exception as e:
                 cur.execute("DELETE FROM cartoes_ponto WHERE id=%s", (int(registro_id),))
                 registrar_log(cur, st.session_state.usuario_logado, "EXCLUSAO_REGISTRO", f"Registro ID {registro_id}")
                 close_conn(pool, conn, cur, commit=True)
-
                 st.success("Registro excluído com sucesso!")
                 st.rerun()
             except Exception as e:
