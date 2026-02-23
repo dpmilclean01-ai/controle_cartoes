@@ -107,7 +107,20 @@ def get_pool():
 def get_conn_cursor():
     pool = get_pool()
     conn = pool.getconn()
-    conn.autocommit = False
+
+    # 🔥 IMPORTANTÍSSIMO EM POOL: limpa qualquer transação pendente/aborted
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+    # não precisa setar autocommit, mas se quiser manter explícito:
+    try:
+        conn.autocommit = False
+    except Exception:
+        # se por algum motivo não conseguir setar, seguimos (default já é False)
+        pass
+
     cur = conn.cursor()
     return pool, conn, cur
 
