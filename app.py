@@ -142,6 +142,25 @@ def close_conn(pool, conn, cur=None, commit=True):
                 pool.putconn(conn)
         except Exception:
             pass
+def sql_df(query, params=None):
+    pool = conn = cur = None
+    try:
+        pool, conn, cur = get_conn_cursor()
+        df = pd.read_sql(query, conn, params=params)
+        close_conn(pool, conn, cur, commit=True)
+        return df
+    except Exception:
+        close_conn(pool, conn, cur, commit=False)
+        raise
+def sql_exec(query, params=None):
+    pool = conn = cur = None
+    try:
+        pool, conn, cur = get_conn_cursor()
+        cur.execute(query, params)
+        close_conn(pool, conn, cur, commit=True)
+    except Exception:
+        close_conn(pool, conn, cur, commit=False)
+        raise
 # =========================================================
 # COOKIES
 # =========================================================
@@ -466,6 +485,7 @@ if menu == "Gestão de Caixas":
                     pool, conn, cur = get_conn_cursor()
                     cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
                     close_conn(pool, conn, cur, commit=True)
+
 
                     # (opcional) se você implementou cache de meses:
                     # get_meses.clear()
