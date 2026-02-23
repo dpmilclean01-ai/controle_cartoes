@@ -124,18 +124,25 @@ def get_conn_cursor():
     cur = conn.cursor()
     return pool, conn, cur
 
-def close_conn(pool, conn, cur, commit=True):
+def close_conn(pool, conn, cur=None, commit=True):
+    # cur pode ser None (quando deu erro antes de criar cursor)
     try:
-        if commit:
-            conn.commit()
-        else:
-            conn.rollback()
+        if conn is not None:
+            if commit:
+                conn.commit()
+            else:
+                conn.rollback()
     finally:
         try:
-            cur.close()
+            if cur is not None:
+                cur.close()
         except Exception:
             pass
-        pool.putconn(conn)
+        try:
+            if pool is not None and conn is not None:
+                pool.putconn(conn)
+        except Exception:
+            pass
 # =========================================================
 # COOKIES
 # =========================================================
@@ -418,8 +425,15 @@ if menu == "Importar Base Excel":
             ultima_atualizacao = EXCLUDED.ultima_atualizacao
         """
 
-        execute_values(cursor, query, registros, page_size=2000)
-        conn.commit()
+        pool = conn = cur = None
+        try:
+            pool, conn, cur = get_conn_cursor()
+            execute_values(cur, query, registros, page_size=2000)
+            close_conn(pool, conn, cur, commit=True)
+            st.success(f"✅ Importação concluída: {len(registros)} registro(s) processado(s).")
+        except Exception as e:
+            close_conn(pool, conn, cur, commit=False)
+            st.error(f"Erro na importação: {e}")
 
         st.success(f"✅ Importação concluída: {len(registros)} registro(s) processado(s).")
 
@@ -446,15 +460,25 @@ if menu == "Gestão de Caixas":
     # CRIAR MÊS
     # -------------------------
     with abas[0]:
-        mes = st.text_input("Mês referência (ex: 01-2026)", key="criar_mes_txt")
         if st.button("Salvar Mês", key="criar_mes_btn"):
-            try:
-                cursor.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
-                conn.commit()
-                st.success("Mês criado!")
-            except Exception:
-                conn.rollback()
-                st.error("Mês já existe ou valor inválido.")
+            if not str(mes).strip():
+                st.warning("Informe o mês (ex: 01-2026).")
+            else:
+                pool = conn = cur = None
+                try:
+                    pool, conn, cur = get_conn_cursor()
+                    cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
+                    close_conn(pool, conn, cur, commit=True)
+
+                    # (opcional) se você implementou cache de meses:
+                    # get_meses.clear()
+
+                    st.success("Mês criado!")
+                    st.rerun()
+
+                except Exception as e:
+                    close_conn(pool, conn, cur, commit=False)
+                    st.error(f"Mês já existe ou valor inválido. Detalhe: {e}")
 
     # -------------------------
     # CRIAR CAIXA
@@ -477,12 +501,19 @@ if menu == "Gestão de Caixas":
                 if not str(numero).strip():
                     st.warning("Informe o número da caixa.")
                 else:
-                    cursor.execute(
-                        "INSERT INTO caixas (numero_caixa, mes_id, localizacao) VALUES (%s,%s,%s)",
-                        (numero.strip(), int(mes_id), (local or "").strip()),
-                    )
-                    conn.commit()
-                    st.success("Caixa criada!")
+                    pool = conn = cur = None
+                    try:
+                        pool, conn, cur = get_conn_cursor()
+                        cur.execute(
+                            "INSERT INTO caixas (numero_caixa, mes_id, localizacao) VALUES (%s,%s,%s)",
+                            (numero.strip(), int(mes_id), (local or "").strip()),
+                        )
+                        close_conn(pool, conn, cur, commit=True)
+                        st.success("Caixa criada!")
+                        st.rerun()
+                    except Exception as e:
+                        close_conn(pool, conn, cur, commit=False)
+                        st.error(f"Erro ao criar caixa: {e}")
 
     # -------------------------
     # OPERAÇÕES (Arquivar/Desarquivar/Excluir)
@@ -768,38 +799,42 @@ if menu == "Gestão de Caixas":
 
             motivo = st.text_input("Motivo da exclusão (obrigatório)", key="motivo_exc_caixa")
 
-            if st.button("❌ Confirmar exclusão da caixa", type="primary", key="btn_exc_caixa"):
-                if len(motivo.strip()) < 3:
-                    st.warning("Informe um motivo (mínimo 3 caracteres).")
-                else:
-                    cursor.execute(
-                        """
-                        UPDATE cartoes_ponto
-                        SET status='DESARQUIVADO',
-                            data_desarquivamento=%s,
-                            usuario_desarquivou=%s,
-                            motivo_desarquivamento=%s
-                        WHERE caixa_id=%s AND status='ARQUIVADO'
-                        """,
-                        (
-                            agora_str(),
-                            st.session_state.usuario_logado,
-                            f"Exclusão da caixa {caixa_id}: {motivo.strip()}",
-                            int(caixa_id),
-                        ),
-                    )
+            pool = conn = cur = None
+            try:
+                pool, conn, cur = get_conn_cursor()
 
-                    cursor.execute("DELETE FROM caixas WHERE id=%s", (int(caixa_id),))
-
-                    registrar_log(
-                        cursor,
+                cur.execute(
+                    """
+                    UPDATE cartoes_ponto
+                    SET status='DESARQUIVADO',
+                        data_desarquivamento=%s,
+                        usuario_desarquivou=%s,
+                        motivo_desarquivamento=%s
+                    WHERE caixa_id=%s AND status='ARQUIVADO'
+                    """,
+                    (
+                        agora_str(),
                         st.session_state.usuario_logado,
-                        "EXCLUSAO_CAIXA",
-                        f"Caixa {caixa_id} excluída | Mes {mes_id} | Motivo: {motivo.strip()}",
-                    )
+                        f"Exclusão da caixa {caixa_id}: {motivo.strip()}",
+                        int(caixa_id),
+                    ),
+                )
 
-                    conn.commit()
-                    st.success("Caixa excluída com sucesso (e registros desarquivados).")
+                cur.execute("DELETE FROM caixas WHERE id=%s", (int(caixa_id),))
+
+                registrar_log(
+                    cur,
+                    st.session_state.usuario_logado,
+                    "EXCLUSAO_CAIXA",
+                    f"Caixa {caixa_id} excluída | Mes {mes_id} | Motivo: {motivo.strip()}",
+                )
+
+                close_conn(pool, conn, cur, commit=True)
+                st.success("Caixa excluída com sucesso.")
+
+            except Exception as e:
+                close_conn(pool, conn, cur, commit=False)
+                st.error(f"Erro ao excluir caixa: {e}")
 
         # =========================================================
         # 4) EXCLUIR MÊS
@@ -842,35 +877,44 @@ if menu == "Gestão de Caixas":
                 if len(motivo.strip()) < 3:
                     st.warning("Informe um motivo (mínimo 3 caracteres).")
                 else:
-                    cursor.execute(
-                        """
-                        UPDATE cartoes_ponto
-                        SET status='DESARQUIVADO',
-                            data_desarquivamento=%s,
-                            usuario_desarquivou=%s,
-                            motivo_desarquivamento=%s
-                        WHERE mes_id=%s AND status='ARQUIVADO'
-                        """,
-                        (
-                            agora_str(),
+                    pool = conn = cur = None
+                    try:
+                        pool, conn, cur = get_conn_cursor()
+
+                        cur.execute(
+                            """
+                            UPDATE cartoes_ponto
+                            SET status='DESARQUIVADO',
+                                data_desarquivamento=%s,
+                                usuario_desarquivou=%s,
+                                motivo_desarquivamento=%s
+                            WHERE mes_id=%s AND status='ARQUIVADO'
+                            """,
+                            (
+                                agora_str(),
+                                st.session_state.usuario_logado,
+                                f"Exclusão do mês {mes_id}: {motivo.strip()}",
+                                int(mes_id),
+                            ),
+                        )
+
+                        cur.execute("DELETE FROM caixas WHERE mes_id=%s", (int(mes_id),))
+                        cur.execute("DELETE FROM meses WHERE id=%s", (int(mes_id),))
+
+                        registrar_log(
+                            cur,
                             st.session_state.usuario_logado,
-                            f"Exclusão do mês {mes_id}: {motivo.strip()}",
-                            int(mes_id),
-                        ),
-                    )
+                            "EXCLUSAO_MES",
+                            f"Mês {mes_id} excluído | Motivo: {motivo.strip()}",
+                        )
 
-                    cursor.execute("DELETE FROM caixas WHERE mes_id=%s", (int(mes_id),))
-                    cursor.execute("DELETE FROM meses WHERE id=%s", (int(mes_id),))
+                        close_conn(pool, conn, cur, commit=True)
+                        st.success("Mês excluído com sucesso (registros desarquivados e caixas removidas).")
+                        st.rerun()
 
-                    registrar_log(
-                        cursor,
-                        st.session_state.usuario_logado,
-                        "EXCLUSAO_MES",
-                        f"Mês {mes_id} excluído | Motivo: {motivo.strip()}",
-                    )
-
-                    conn.commit()
-                    st.success("Mês excluído com sucesso (registros desarquivados e caixas removidas).")
+                    except Exception as e:
+                        close_conn(pool, conn, cur, commit=False)
+                        st.error(f"Erro ao excluir mês: {e}")
 
 # =========================================================
 # CONSULTAR ARQUIVAMENTOS
@@ -961,11 +1005,18 @@ except Exception as e:
         registro_id = st.selectbox("Selecionar ID para excluir", df["id"].tolist(), key="cons_del_id")
 
         if st.button("Excluir Registro", key="cons_del_btn"):
-            cursor.execute("DELETE FROM cartoes_ponto WHERE id=%s", (int(registro_id),))
-            registrar_log(cursor, st.session_state.usuario_logado, "EXCLUSAO_REGISTRO", f"Registro ID {registro_id}")
-            conn.commit()
-            st.success("Registro excluído com sucesso!")
-            st.rerun()
+            pool = conn = cur = None
+            try:
+                pool, conn, cur = get_conn_cursor()
+                cur.execute("DELETE FROM cartoes_ponto WHERE id=%s", (int(registro_id),))
+                registrar_log(cur, st.session_state.usuario_logado, "EXCLUSAO_REGISTRO", f"Registro ID {registro_id}")
+                close_conn(pool, conn, cur, commit=True)
+
+                st.success("Registro excluído com sucesso!")
+                st.rerun()
+            except Exception as e:
+                close_conn(pool, conn, cur, commit=False)
+                st.error(f"Erro ao excluir registro: {e}")
 
 # =========================================================
 # AUDITORIA (simples)
@@ -1077,19 +1128,22 @@ if menu == "Gestão de Usuários":
         perfil = st.selectbox("Perfil", ["admin", "usuario"], key="usr_role")
 
         if st.button("Criar Usuário", key="usr_create"):
+            pool = conn = cur = None
             try:
-                cursor.execute(
+                pool, conn, cur = get_conn_cursor()
+                cur.execute(
                     "INSERT INTO usuarios (username, password, perfil) VALUES (%s,%s,%s)",
                     (novo_user.strip(), nova_senha, perfil),
                 )
-                conn.commit()
+                close_conn(pool, conn, cur, commit=True)
                 st.success("Usuário criado com sucesso!")
+                st.rerun()
             except psycopg2.IntegrityError:
-                conn.rollback()
+                close_conn(pool, conn, cur, commit=False)
                 st.error("Usuário já existe.")
-            except Exception:
-                conn.rollback()
-                st.error("Erro ao criar usuário.")
+            except Exception as e:
+                close_conn(pool, conn, cur, commit=False)
+                st.error(f"Erro ao criar usuário: {e}")
 
     with abas_u[1]:
         df_users = pd.read_sql("SELECT id, username, perfil FROM usuarios ORDER BY id", conn)
@@ -1097,7 +1151,13 @@ if menu == "Gestão de Usuários":
 
         user_id = st.selectbox("Selecionar usuário para excluir", df_users["id"].tolist(), key="usr_del_id")
         if st.button("Excluir Usuário", key="usr_del_btn"):
-            cursor.execute("DELETE FROM usuarios WHERE id=%s", (int(user_id),))
-            conn.commit()
-            st.success("Usuário excluído!")
-            st.rerun()
+            pool = conn = cur = None
+            try:
+                pool, conn, cur = get_conn_cursor()
+                cur.execute("DELETE FROM usuarios WHERE id=%s", (int(user_id),))
+                close_conn(pool, conn, cur, commit=True)
+                st.success("Usuário excluído!")
+                st.rerun()
+            except Exception as e:
+                close_conn(pool, conn, cur, commit=False)
+                st.error(f"Erro ao excluir usuário: {e}")
