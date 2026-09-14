@@ -8,7 +8,6 @@ import psycopg2
 import streamlit as st
 from psycopg2.extras import execute_batch, execute_values
 from psycopg2.pool import ThreadedConnectionPool
-from streamlit_cookies_manager import EncryptedCookieManager
 
 # =========================================================
 # CONFIG STREAMLIT
@@ -352,13 +351,6 @@ def carregar_mapa_localizacoes(conteudo_arquivo):
 
 
 # =========================================================
-# COOKIES
-# =========================================================
-cookies = EncryptedCookieManager(prefix="controle_cartoes_", password="senha_super_secreta")
-if not cookies.ready():
-    st.stop()
-
-# =========================================================
 # MIGRAÇÕES / TABELAS / ÍNDICES
 # =========================================================
 def run_migrations():
@@ -493,25 +485,6 @@ def inicializar_banco():
 inicializar_banco()
 
 # =========================================================
-# AUTO LOGIN
-# =========================================================
-if st.session_state.usuario_logado is None:
-    try:
-        user_cookie = cookies.get("usuario")
-    except Exception:
-        user_cookie = None
-
-    if user_cookie:
-        try:
-            df_u = sql_df("SELECT username, perfil FROM usuarios WHERE username=%s", params=(user_cookie,))
-            if not df_u.empty:
-                st.session_state.usuario_logado = df_u.iloc[0]["username"]
-                st.session_state.perfil = df_u.iloc[0]["perfil"]
-        except Exception:
-            # ignora cookie se falhar
-            pass
-
-# =========================================================
 # LOGIN
 # =========================================================
 if st.session_state.usuario_logado is None:
@@ -519,8 +492,6 @@ if st.session_state.usuario_logado is None:
 
     user = st.text_input("Usuário", key="login_user")
     senha = st.text_input("Senha", type="password", key="login_pass")
-    manter = st.checkbox("Manter conectado", key="login_keep")
-
     if st.button("Entrar", key="login_btn"):
         pool, conn, cur = get_conn_cursor()
         try:
@@ -534,9 +505,6 @@ if st.session_state.usuario_logado is None:
             if usuario:
                 st.session_state.usuario_logado = usuario[0]
                 st.session_state.perfil = usuario[1]
-                if manter:
-                    cookies["usuario"] = usuario[0]
-                    cookies.save()
                 st.success("Login realizado!")
                 st.rerun()
             else:
@@ -567,8 +535,6 @@ menu = st.sidebar.radio(
 if st.sidebar.button("🚪 Sair", key="btn_logout"):
     st.session_state.usuario_logado = None
     st.session_state.perfil = None
-    cookies["usuario"] = ""
-    cookies.save()
     st.rerun()
 
 # =========================================================
