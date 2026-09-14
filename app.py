@@ -1,4 +1,6 @@
+import io
 import os
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -33,6 +35,39 @@ def formatar_data(valor):
         return dt.strftime("%d-%m-%Y")
     except Exception:
         return None
+
+
+def normalizar_mes_referencia(valor):
+    """Aceita 03.2026, 03/2026 ou 03-2026 e devolve 03-2026."""
+    if valor is None:
+        return None
+    v = str(valor).strip().replace('.', '-').replace('/', '-')
+    m = re.fullmatch(r"(\d{1,2})-(\d{4})", v)
+    if not m:
+        return None
+    mes = int(m.group(1))
+    ano = int(m.group(2))
+    if mes < 1 or mes > 12:
+        return None
+    return f"{mes:02d}-{ano:04d}"
+
+
+def normalizar_matricula(valor):
+    if valor is None or pd.isna(valor):
+        return ""
+    v = str(valor).strip()
+    if v.endswith('.0') and v[:-2].isdigit():
+        v = v[:-2]
+    return v
+
+
+def normalizar_numero_caixa(valor):
+    if valor is None or pd.isna(valor):
+        return ""
+    v = str(valor).strip()
+    if v.endswith('.0') and v[:-2].isdigit():
+        v = v[:-2]
+    return v
 
 
 def registrar_log(cur, usuario, acao, detalhe):
@@ -171,6 +206,151 @@ def buscar_colaboradores(termo, limite=150):
     )
 
 
+def listar_contratos():
+    df = sql_df(
+        """
+        SELECT DISTINCT contrato
+        FROM base_colaboradores
+        WHERE contrato IS NOT NULL AND BTRIM(contrato) <> ''
+        ORDER BY contrato
+        """
+    )
+    return df["contrato"].dropna().tolist() if not df.empty else []
+
+
+def resumo_base():
+    return sql_df(
+        """
+        SELECT COUNT(*) AS total, MAX(ultima_atualizacao) AS ultima_atualizacao
+        FROM base_colaboradores
+        """
+    )
+
+
+@st.cache_data(show_spinner=False)
+def analisar_planilha_historica(conteudo_arquivo):
+    """Analisa o modelo histórico sem gravar nada no banco."""
+    xls = pd.ExcelFile(io.BytesIO(conteudo_arquivo), engine="openpyxl")
+    abas_mensais = [
+        aba for aba in xls.sheet_names
+        if re.fullmatch(r"\d{2}[.-]\d{4}", str(aba).strip())
+    ]
+
+    mapa_localizacao = {}
+    if "CAIXAS" in xls.sheet_names:
+        try:
+            df_caixas = pd.read_excel(xls, sheet_name="CAIXAS", dtype=str)
+            if not df_caixas.empty:
+                df_caixas.columns = [
+                    str(c).strip().lower().replace('*', '').strip()
+                    for c in df_caixas.columns
+                ]
+                if {"mes_referencia", "numero_caixa"}.issubset(df_caixas.columns):
+                    for _, r in df_caixas.iterrows():
+                        mes = normalizar_mes_referencia(r.get("mes_referencia"))
+                        caixa = normalizar_numero_caixa(r.get("numero_caixa"))
+                        loc = "" if pd.isna(r.get("localizacao")) else str(r.get("localizacao")).strip()
+                        if mes and caixa:
+                            mapa_localizacao[(mes, caixa)] = loc
+        except Exception:
+            pass
+
+    resumo = []
+    for aba in abas_mensais:
+        mes_ref = normalizar_mes_referencia(aba)
+        try:
+            df = pd.read_excel(
+                xls, sheet_name=aba, header=2, usecols="A:F", dtype=str
+            )
+        except Exception:
+            resumo.append({
+                "aba": aba, "mes": mes_ref or aba, "registros": 0,
+                "caixas": 0, "incompletos": 0, "duplicados": 0, "localizacoes_ausentes": 0,
+                "erro": "Não foi possível ler a aba"
+            })
+            continue
+
+        if df.shape[1] < 4:
+            resumo.append({
+                "aba": aba, "mes": mes_ref or aba, "registros": 0,
+                "caixas": 0, "incompletos": 0, "duplicados": 0, "localizacoes_ausentes": 0,
+                "erro": "Estrutura inesperada"
+            })
+            continue
+
+        cols = ["matricula", "nome", "contrato", "numero_caixa", "localizacao", "status"]
+        while df.shape[1] < len(cols):
+            df[f"_extra_{df.shape[1]}"] = None
+        df = df.iloc[:, :6].copy()
+        df.columns = cols
+        df["matricula"] = df["matricula"].apply(normalizar_matricula)
+        df["numero_caixa"] = df["numero_caixa"].apply(normalizar_numero_caixa)
+
+        tem_mat = df["matricula"].ne("")
+        tem_caixa = df["numero_caixa"].ne("")
+        validos = df[tem_mat & tem_caixa].copy()
+        incompletos = int((tem_mat ^ tem_caixa).sum())
+        duplicados = int(validos.duplicated(subset=["matricula"], keep="first").sum())
+        validos_unicos = validos.drop_duplicates(subset=["matricula"], keep="first").copy()
+
+        caixas = sorted(validos_unicos["numero_caixa"].dropna().unique().tolist())
+        loc_ausentes = sum(
+            1 for cx in caixas if not mapa_localizacao.get((mes_ref, cx), "")
+        )
+
+        resumo.append({
+            "aba": aba,
+            "mes": mes_ref or aba,
+            "registros": int(len(validos_unicos)),
+            "duplicados": duplicados,
+            "caixas": int(len(caixas)),
+            "incompletos": incompletos,
+            "localizacoes_ausentes": int(loc_ausentes),
+            "erro": "",
+        })
+
+    return pd.DataFrame(resumo)
+
+
+def carregar_dados_aba_historica(conteudo_arquivo, aba):
+    xls = pd.ExcelFile(io.BytesIO(conteudo_arquivo), engine="openpyxl")
+    df = pd.read_excel(xls, sheet_name=aba, header=2, usecols="A:F", dtype=str)
+    cols = ["matricula", "nome", "contrato", "numero_caixa", "localizacao", "status"]
+    while df.shape[1] < len(cols):
+        df[f"_extra_{df.shape[1]}"] = None
+    df = df.iloc[:, :6].copy()
+    df.columns = cols
+    df["matricula"] = df["matricula"].apply(normalizar_matricula)
+    df["numero_caixa"] = df["numero_caixa"].apply(normalizar_numero_caixa)
+    df = df[(df["matricula"] != "") & (df["numero_caixa"] != "")].copy()
+    # O banco aceita somente uma matrícula por mês. Duplicidades da planilha são ignoradas, mantendo a primeira.
+    df = df.drop_duplicates(subset=["matricula"], keep="first").copy()
+    df["nome"] = df["nome"].fillna("").astype(str).str.strip()
+    df["contrato"] = df["contrato"].fillna("").astype(str).str.strip()
+    return df
+
+
+def carregar_mapa_localizacoes(conteudo_arquivo):
+    mapa = {}
+    try:
+        xls = pd.ExcelFile(io.BytesIO(conteudo_arquivo), engine="openpyxl")
+        if "CAIXAS" not in xls.sheet_names:
+            return mapa
+        df = pd.read_excel(xls, sheet_name="CAIXAS", dtype=str)
+        df.columns = [str(c).strip().lower().replace('*', '').strip() for c in df.columns]
+        if not {"mes_referencia", "numero_caixa"}.issubset(df.columns):
+            return mapa
+        for _, r in df.iterrows():
+            mes = normalizar_mes_referencia(r.get("mes_referencia"))
+            caixa = normalizar_numero_caixa(r.get("numero_caixa"))
+            loc = "" if pd.isna(r.get("localizacao")) else str(r.get("localizacao")).strip()
+            if mes and caixa:
+                mapa[(mes, caixa)] = loc
+    except Exception:
+        pass
+    return mapa
+
+
 # =========================================================
 # COOKIES
 # =========================================================
@@ -238,6 +418,12 @@ def run_migrations():
         cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS data_desarquivamento TEXT")
         cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS usuario_desarquivou TEXT")
         cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS motivo_desarquivamento TEXT")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS origem TEXT DEFAULT 'MANUAL'")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS arquivo_origem TEXT")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS aba_origem TEXT")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS nome_historico TEXT")
+        cur.execute("ALTER TABLE cartoes_ponto ADD COLUMN IF NOT EXISTS contrato_historico TEXT")
+        cur.execute("UPDATE cartoes_ponto SET origem='MANUAL' WHERE origem IS NULL OR BTRIM(origem)=''")
 
         cur.execute(
             """
@@ -269,6 +455,9 @@ def run_migrations():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes ON caixas(mes_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes_status ON cartoes_ponto(mes_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_caixa_status ON cartoes_ponto(caixa_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_base_contrato ON base_colaboradores(contrato)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_origem ON cartoes_ponto(origem)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes_numero ON caixas(mes_id, numero_caixa)")
 
         close_conn(pool, conn, cur, commit=True)
     except Exception as e:
@@ -294,8 +483,14 @@ def ensure_admin():
         st.stop()
 
 
-run_migrations()
-ensure_admin()
+@st.cache_resource
+def inicializar_banco():
+    run_migrations()
+    ensure_admin()
+    return True
+
+
+inicializar_banco()
 
 # =========================================================
 # AUTO LOGIN
@@ -359,6 +554,7 @@ menu = st.sidebar.radio(
     "Menu",
     [
         "Importar Base Excel",
+        "Importar Histórico",
         "Visualizar Base",
         "Gestão de Caixas",
         "Consultar Arquivamentos",
@@ -386,6 +582,15 @@ if menu == "Importar Base Excel":
     st.header("📊 Importar / Atualizar Base de Colaboradores")
     st.info("⚠ Datas devem estar no formato DD-MM-YYYY (ou datas reconhecíveis pelo Excel).")
 
+    try:
+        rb = resumo_base()
+        if not rb.empty:
+            total_base = int(rb.iloc[0]["total"] or 0)
+            ultima_base = rb.iloc[0]["ultima_atualizacao"]
+            st.caption(f"Base atual: {total_base:,} colaborador(es) • Última atualização: {ultima_base or 'sem registro'}".replace(',', '.'))
+    except Exception:
+        pass
+
     arquivo = st.file_uploader("Envie a planilha (.xlsx)", type=["xlsx"], key="upl_base")
 
     if arquivo is not None:
@@ -412,7 +617,7 @@ if menu == "Importar Base Excel":
             st.write("Colunas obrigatórias:", obrigatorias)
             st.stop()
 
-        df["matricula"] = df["matricula"].astype(str).str.strip()
+        df["matricula"] = df["matricula"].apply(normalizar_matricula)
         df["data_admissao"] = df["data_admissao"].apply(formatar_data)
         df["data_demissao"] = df["data_demissao"].apply(formatar_data)
         ultima = agora_str()
@@ -458,15 +663,278 @@ if menu == "Importar Base Excel":
             st.error(f"Erro na importação: {e}")
 
 # =========================================================
+# IMPORTAÇÃO HISTÓRICA
+# =========================================================
+if menu == "Importar Histórico":
+    if st.session_state.perfil != "admin":
+        st.error("Apenas administradores podem importar histórico.")
+        st.stop()
+
+    st.header("📥 Importar Histórico de Cartões")
+    st.info(
+        "Esta opção NÃO substitui a base atual de colaboradores. "
+        "Ela migra os registros das abas mensais para o histórico do sistema."
+    )
+    st.caption(
+        "Regra usada: toda linha com matrícula + número da caixa será importada como ARQUIVADO, "
+        "com origem IMPORTACAO. Registros já existentes para a mesma matrícula e mês são preservados."
+    )
+
+    arquivo_hist = st.file_uploader(
+        "Envie a planilha histórica (.xlsx)", type=["xlsx"], key="upl_historico"
+    )
+
+    if arquivo_hist is not None:
+        conteudo_hist = arquivo_hist.getvalue()
+        try:
+            resumo_hist = analisar_planilha_historica(conteudo_hist)
+        except Exception as e:
+            st.error(f"Não foi possível analisar a planilha: {e}")
+            st.stop()
+
+        if resumo_hist.empty:
+            st.warning("Nenhuma aba mensal no padrão MM.AAAA ou MM-AAAA foi encontrada.")
+            st.stop()
+
+        st.subheader("Prévia da importação")
+        st.dataframe(
+            resumo_hist[[
+                "aba", "mes", "registros", "duplicados", "caixas", "incompletos", "localizacoes_ausentes", "erro"
+            ]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        total_registros_hist = int(resumo_hist["registros"].sum())
+        total_incompletos_hist = int(resumo_hist["incompletos"].sum())
+        total_duplicados_hist = int(resumo_hist["duplicados"].sum())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Abas mensais", len(resumo_hist))
+        c2.metric("Registros válidos", total_registros_hist)
+        c3.metric("Duplicados ignorados", total_duplicados_hist)
+        c4.metric("Linhas incompletas", total_incompletos_hist)
+
+        abas_validas = resumo_hist.loc[resumo_hist["erro"] == "", "aba"].tolist()
+        abas_selecionadas = st.multiselect(
+            "Abas que serão importadas",
+            abas_validas,
+            default=abas_validas,
+            key="hist_abas_selecionadas",
+        )
+
+        confirmar = st.checkbox(
+            "Confirmo que revisei a prévia e desejo importar os registros selecionados.",
+            key="hist_confirmar",
+        )
+
+        if st.button(
+            "📥 Importar histórico selecionado",
+            type="primary",
+            disabled=not confirmar or not abas_selecionadas,
+            key="btn_importar_historico",
+        ):
+            mapa_localizacoes = carregar_mapa_localizacoes(conteudo_hist)
+            resultados = []
+            barra = st.progress(0)
+
+            for pos, aba in enumerate(abas_selecionadas, start=1):
+                mes_ref = normalizar_mes_referencia(aba)
+                novos = 0
+                existentes = 0
+                erros = 0
+                caixas_criadas = 0
+                pool = conn = cur = None
+
+                try:
+                    dados = carregar_dados_aba_historica(conteudo_hist, aba)
+                    pool, conn, cur = get_conn_cursor()
+
+                    # 1) Garante o mês
+                    cur.execute(
+                        "INSERT INTO meses (mes_referencia) VALUES (%s) ON CONFLICT (mes_referencia) DO NOTHING",
+                        (mes_ref,),
+                    )
+                    cur.execute("SELECT id FROM meses WHERE mes_referencia=%s", (mes_ref,))
+                    mes_id = int(cur.fetchone()[0])
+
+                    # 2) Localiza/cria caixas usadas na aba
+                    caixas_ids = {}
+                    for numero_caixa in sorted(dados["numero_caixa"].unique().tolist()):
+                        cur.execute(
+                            "SELECT id, localizacao FROM caixas WHERE mes_id=%s AND numero_caixa=%s ORDER BY id LIMIT 1",
+                            (mes_id, numero_caixa),
+                        )
+                        achou = cur.fetchone()
+                        loc_planilha = mapa_localizacoes.get((mes_ref, numero_caixa), "")
+                        if not loc_planilha:
+                            locs_aba = dados.loc[dados["numero_caixa"] == numero_caixa, "localizacao"].dropna().astype(str).str.strip()
+                            locs_aba = locs_aba[locs_aba != ""]
+                            if not locs_aba.empty:
+                                loc_planilha = locs_aba.iloc[0]
+
+                        if achou:
+                            caixa_id = int(achou[0])
+                            loc_atual = achou[1] or ""
+                            if loc_planilha and not str(loc_atual).strip():
+                                cur.execute(
+                                    "UPDATE caixas SET localizacao=%s WHERE id=%s",
+                                    (loc_planilha, caixa_id),
+                                )
+                        else:
+                            cur.execute(
+                                "INSERT INTO caixas (numero_caixa, mes_id, localizacao) VALUES (%s,%s,%s) RETURNING id",
+                                (numero_caixa, mes_id, loc_planilha),
+                            )
+                            caixa_id = int(cur.fetchone()[0])
+                            caixas_criadas += 1
+
+                        caixas_ids[numero_caixa] = caixa_id
+
+                    # 3) Identifica o que já existe antes de inserir
+                    mats = dados["matricula"].astype(str).tolist()
+                    existentes_set = set()
+                    if mats:
+                        cur.execute(
+                            "SELECT matricula FROM cartoes_ponto WHERE mes_id=%s AND matricula = ANY(%s)",
+                            (mes_id, mats),
+                        )
+                        existentes_set = {str(r[0]) for r in cur.fetchall()}
+
+                    registros_novos = []
+                    ts = agora_str()
+                    for _, r in dados.iterrows():
+                        mat = str(r["matricula"])
+                        if mat in existentes_set:
+                            existentes += 1
+                            continue
+                        caixa_id = caixas_ids.get(r["numero_caixa"])
+                        if not caixa_id:
+                            erros += 1
+                            continue
+                        registros_novos.append((
+                            mat,
+                            caixa_id,
+                            mes_id,
+                            ts,
+                            "ARQUIVADO",
+                            "IMPORTACAO",
+                            arquivo_hist.name,
+                            aba,
+                            r.get("nome", ""),
+                            r.get("contrato", ""),
+                        ))
+
+                    if registros_novos:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO cartoes_ponto
+                            (matricula, caixa_id, mes_id, data_registro, status, origem,
+                             arquivo_origem, aba_origem, nome_historico, contrato_historico)
+                            VALUES %s
+                            ON CONFLICT (matricula, mes_id) DO NOTHING
+                            """,
+                            registros_novos,
+                            page_size=2000,
+                        )
+                        novos = len(registros_novos)
+
+                    registrar_log(
+                        cur,
+                        st.session_state.usuario_logado,
+                        "IMPORTACAO_HISTORICA",
+                        (
+                            f"Arquivo {arquivo_hist.name} | Aba {aba} | Mes {mes_ref} | "
+                            f"Novos {novos} | Existentes {existentes} | Erros {erros} | "
+                            f"Caixas criadas {caixas_criadas}"
+                        ),
+                    )
+
+                    close_conn(pool, conn, cur, commit=True)
+                    pool = conn = cur = None
+                except Exception as e:
+                    if pool is not None or conn is not None:
+                        close_conn(pool, conn, cur, commit=False)
+                    erros += 1
+                    resultados.append({
+                        "aba": aba,
+                        "mes": mes_ref,
+                        "novos": novos,
+                        "já existentes": existentes,
+                        "caixas criadas": caixas_criadas,
+                        "erros": erros,
+                        "detalhe": str(e),
+                    })
+                    barra.progress(pos / len(abas_selecionadas))
+                    continue
+
+                resultados.append({
+                    "aba": aba,
+                    "mes": mes_ref,
+                    "novos": novos,
+                    "já existentes": existentes,
+                    "caixas criadas": caixas_criadas,
+                    "erros": erros,
+                    "detalhe": "OK",
+                })
+                barra.progress(pos / len(abas_selecionadas))
+
+            st.success("Importação histórica finalizada.")
+            st.dataframe(pd.DataFrame(resultados), use_container_width=True, hide_index=True)
+            st.caption(
+                "Observação: data_registro representa a data da migração para o app. "
+                "A planilha não contém a data original em que o cartão foi fisicamente arquivado."
+            )
+
+
+# =========================================================
 # VISUALIZAR BASE
 # =========================================================
 if menu == "Visualizar Base":
     st.header("📋 Base Atual no Sistema")
-    df = sql_df("SELECT * FROM base_colaboradores ORDER BY id DESC")
+
+    f1, f2, f3 = st.columns([2, 2, 1])
+    busca_base = f1.text_input("Buscar por nome ou matrícula", key="base_busca")
+    contratos_base = ["Todos"] + listar_contratos()
+    contrato_base = f2.selectbox("Contrato", contratos_base, key="base_contrato")
+    tamanho_pagina = f3.selectbox("Registros por página", [100, 250, 500], index=1, key="base_page_size")
+
+    where = ["1=1"]
+    params = []
+    if busca_base.strip():
+        where.append("(nome ILIKE %s OR matricula ILIKE %s)")
+        termo = f"%{busca_base.strip()}%"
+        params.extend([termo, termo])
+    if contrato_base != "Todos":
+        where.append("contrato=%s")
+        params.append(contrato_base)
+
+    where_sql = " AND ".join(where)
+    total_df = sql_df(
+        f"SELECT COUNT(*) AS total FROM base_colaboradores WHERE {where_sql}",
+        tuple(params) if params else None,
+    )
+    total = int(total_df.iloc[0]["total"] if not total_df.empty else 0)
+    paginas = max(1, (total + tamanho_pagina - 1) // tamanho_pagina)
+    pagina = st.number_input("Página", min_value=1, max_value=paginas, value=1, step=1, key="base_pagina")
+    offset = (int(pagina) - 1) * tamanho_pagina
+
+    query = f"""
+        SELECT id, matricula, nome, contrato, responsavel, data_admissao,
+               data_demissao, sit_folha, ultima_atualizacao
+        FROM base_colaboradores
+        WHERE {where_sql}
+        ORDER BY id DESC
+        LIMIT %s OFFSET %s
+    """
+    params_lista = list(params) + [tamanho_pagina, offset]
+    df = sql_df(query, tuple(params_lista))
+
+    st.caption(f"Exibindo {len(df)} registro(s) nesta página • Total encontrado: {total}")
     if df.empty:
         st.warning("Nenhum registro encontrado.")
     else:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 # =========================================================
 # GESTÃO DE CAIXAS
@@ -484,13 +952,14 @@ if menu == "Gestão de Caixas":
         mes = st.text_input("Mês referência (ex: 01-2026)", key="criar_mes_txt")
 
         if st.button("Salvar Mês", key="criar_mes_btn"):
-            if not mes or not mes.strip():
-                st.warning("Digite o mês no formato 01-2026.")
+            mes_ok = normalizar_mes_referencia(mes)
+            if not mes_ok:
+                st.warning("Informe um mês válido, por exemplo 01-2026, 01/2026 ou 01.2026.")
             else:
                 pool = conn = cur = None
                 try:
                     pool, conn, cur = get_conn_cursor()
-                    cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes.strip(),))
+                    cur.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes_ok,))
                     close_conn(pool, conn, cur, commit=True)
                     st.success("Mês criado!")
                     st.rerun()
@@ -607,15 +1076,14 @@ if menu == "Gestão de Caixas":
                 key="modo_selecao_arq",
             )
 
-            base = sql_df("SELECT matricula, nome, contrato FROM base_colaboradores")
-            if base.empty:
-                st.warning("Base de colaboradores vazia. Importe a base primeiro.")
-                st.stop()
-
             selecionados_matriculas = []
 
             if modo == "Por contrato":
-                contratos_lista = sorted(base["contrato"].dropna().unique().tolist())
+                contratos_lista = listar_contratos()
+                if not contratos_lista:
+                    st.warning("Base de colaboradores vazia. Importe a base primeiro.")
+                    st.stop()
+
                 idx_contrato = 0
                 if st.session_state.memoria.get("contrato_gestao") in contratos_lista:
                     idx_contrato = contratos_lista.index(st.session_state.memoria.get("contrato_gestao"))
@@ -628,7 +1096,10 @@ if menu == "Gestão de Caixas":
                 )
                 st.session_state.memoria["contrato_gestao"] = contrato
 
-                funcionarios = base[base["contrato"] == contrato].sort_values(by="matricula").copy()
+                funcionarios = sql_df(
+                    "SELECT matricula, nome FROM base_colaboradores WHERE contrato=%s ORDER BY matricula",
+                    params=(contrato,),
+                )
 
                 selecionados_matriculas = st.multiselect(
                     "Selecione os funcionários",
@@ -935,7 +1406,8 @@ if menu == "Consultar Arquivamentos":
         st.warning("Nenhum mês cadastrado.")
         st.stop()
 
-    mes_opcoes = ["Todos"] + meses["id"].tolist()
+    # Começa no mês mais recente para evitar carregar todo o histórico sem necessidade.
+    mes_opcoes = meses["id"].tolist() + ["Todos"]
     mes_id = st.selectbox(
         "Mês",
         mes_opcoes,
@@ -943,14 +1415,13 @@ if menu == "Consultar Arquivamentos":
         format_func=lambda x: "Todos" if x == "Todos" else meses.loc[meses["id"] == x, "mes_referencia"].values[0],
     )
 
-    base = sql_df("SELECT matricula, nome, contrato FROM base_colaboradores")
-    contratos = ["Todos"] + sorted(base["contrato"].dropna().unique().tolist())
+    contratos = ["Todos"] + listar_contratos()
     contrato_selecionado = st.selectbox("Contrato (opcional)", contratos, key="cons_contrato")
 
     if mes_id == "Todos":
         caixas = sql_df("SELECT * FROM caixas ORDER BY id")
     else:
-        caixas = sql_df("SELECT * FROM caixas WHERE mes_id=%s ORDER BY id", params=(int(mes_id),))
+        caixas = sql_df("SELECT * FROM caixas WHERE mes_id=%s ORDER BY numero_caixa", params=(int(mes_id),))
 
     caixa_opcoes = ["Todas"] + caixas["id"].tolist()
     caixa_selecionada = st.selectbox(
@@ -960,45 +1431,87 @@ if menu == "Consultar Arquivamentos":
         format_func=lambda x: "Todas" if x == "Todas" else f"Caixa {caixas.loc[caixas['id']==x,'numero_caixa'].values[0]}",
     )
 
+    origem_sel = st.selectbox("Origem", ["Todas", "MANUAL", "IMPORTACAO"], key="cons_origem")
     busca = st.text_input("Buscar por nome ou matrícula", key="cons_busca")
 
-    query = """
-        SELECT cp.id, cp.matricula, b.nome, b.contrato,
-               c.numero_caixa, c.localizacao, cp.data_registro, cp.status
+    filtros = ["1=1"]
+    params = []
+    if mes_id != "Todos":
+        filtros.append("cp.mes_id=%s")
+        params.append(int(mes_id))
+    if caixa_selecionada != "Todas":
+        filtros.append("cp.caixa_id=%s")
+        params.append(int(caixa_selecionada))
+    if contrato_selecionado != "Todos":
+        filtros.append("COALESCE(NULLIF(cp.contrato_historico,''), b.contrato)=%s")
+        params.append(contrato_selecionado)
+    if origem_sel != "Todas":
+        filtros.append("COALESCE(cp.origem,'MANUAL')=%s")
+        params.append(origem_sel)
+    if busca.strip():
+        termo = f"%{busca.strip()}%"
+        filtros.append("(COALESCE(NULLIF(cp.nome_historico,''), b.nome) ILIKE %s OR cp.matricula ILIKE %s)")
+        params.extend([termo, termo])
+
+    where_sql = " AND ".join(filtros)
+
+    metricas = sql_df(
+        f"""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE cp.status='ARQUIVADO') AS arquivados,
+               COUNT(*) FILTER (WHERE cp.status='DESARQUIVADO') AS desarquivados,
+               COUNT(*) FILTER (WHERE COALESCE(cp.origem,'MANUAL')='IMPORTACAO') AS importados
+        FROM cartoes_ponto cp
+        LEFT JOIN base_colaboradores b ON cp.matricula=b.matricula
+        LEFT JOIN caixas c ON cp.caixa_id=c.id
+        WHERE {where_sql}
+        """,
+        tuple(params) if params else None,
+    )
+
+    total = int(metricas.iloc[0]["total"] if not metricas.empty else 0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total", total)
+    c2.metric("Arquivados", int(metricas.iloc[0]["arquivados"] or 0))
+    c3.metric("Desarquivados", int(metricas.iloc[0]["desarquivados"] or 0))
+    c4.metric("Importados", int(metricas.iloc[0]["importados"] or 0))
+
+    tamanho = st.selectbox("Registros por página", [100, 250, 500], index=1, key="cons_tamanho")
+    paginas = max(1, (total + tamanho - 1) // tamanho)
+    pagina = st.number_input("Página", min_value=1, max_value=paginas, value=1, step=1, key="cons_pagina")
+    offset = (int(pagina) - 1) * tamanho
+
+    query = f"""
+        SELECT cp.id,
+               cp.matricula,
+               COALESCE(NULLIF(cp.nome_historico,''), b.nome) AS nome,
+               COALESCE(NULLIF(cp.contrato_historico,''), b.contrato) AS contrato,
+               m.mes_referencia,
+               c.numero_caixa,
+               c.localizacao,
+               cp.data_registro,
+               cp.status,
+               COALESCE(cp.origem,'MANUAL') AS origem,
+               cp.aba_origem,
+               cp.arquivo_origem
         FROM cartoes_ponto cp
         LEFT JOIN base_colaboradores b ON cp.matricula = b.matricula
         LEFT JOIN caixas c ON cp.caixa_id = c.id
-        WHERE 1=1
+        LEFT JOIN meses m ON cp.mes_id = m.id
+        WHERE {where_sql}
+        ORDER BY cp.id DESC
+        LIMIT %s OFFSET %s
     """
-    params = []
-
-    if mes_id != "Todos":
-        query += " AND cp.mes_id=%s"
-        params.append(int(mes_id))
-
-    if caixa_selecionada != "Todas":
-        query += " AND cp.caixa_id=%s"
-        params.append(int(caixa_selecionada))
-
-    if contrato_selecionado != "Todos":
-        query += " AND b.contrato=%s"
-        params.append(contrato_selecionado)
-
-    df = sql_df(query, params=tuple(params) if params else None)
-
-    if busca:
-        df = df[
-            df["nome"].str.contains(busca, case=False, na=False)
-            | df["matricula"].astype(str).str.contains(busca, case=False, na=False)
-        ]
+    df = sql_df(query, tuple(list(params) + [tamanho, offset]))
 
     if df.empty:
         st.info("Nenhum arquivamento encontrado com esses filtros.")
     else:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("🗑 Excluir Registro (apaga da tabela)")
+        st.caption("Use apenas quando realmente for necessário. A exclusão é registrada no log.")
         registro_id = st.selectbox("Selecionar ID para excluir", df["id"].tolist(), key="cons_del_id")
 
         if st.button("Excluir Registro", key="cons_del_btn"):
@@ -1020,8 +1533,6 @@ if menu == "Auditoria":
     st.header("🧠 Auditoria de Cartões")
 
     meses = sql_df("SELECT * FROM meses ORDER BY id DESC")
-    base = sql_df("SELECT * FROM base_colaboradores")
-
     if meses.empty:
         st.warning("Cadastre meses primeiro.")
         st.stop()
@@ -1059,14 +1570,22 @@ if menu == "Auditoria":
 
     st.info(f"Período auditado: {data_inicio.strftime('%d-%m-%Y')} até {data_fim.strftime('%d-%m-%Y')}")
 
-    contratos = sorted(base["contrato"].dropna().unique().tolist())
+    contratos = listar_contratos()
     if not contratos:
         st.warning("Sem contratos na base.")
         st.stop()
 
     contrato_selecionado = st.selectbox("Contrato", contratos, key="aud_contrato")
 
-    base_c = base[base["contrato"] == contrato_selecionado].copy()
+    # Carrega somente o contrato escolhido, em vez da base inteira.
+    base_c = sql_df(
+        """
+        SELECT matricula, nome, data_admissao, data_demissao
+        FROM base_colaboradores
+        WHERE contrato=%s
+        """,
+        params=(contrato_selecionado,),
+    )
     base_c["data_admissao"] = pd.to_datetime(base_c["data_admissao"], dayfirst=True, errors="coerce")
     base_c["data_demissao"] = pd.to_datetime(base_c["data_demissao"], dayfirst=True, errors="coerce")
 
@@ -1098,7 +1617,7 @@ if menu == "Auditoria":
 
     if not faltando.empty:
         st.error("⚠ Colaboradores sem cartão no período:")
-        st.dataframe(faltando[["matricula", "nome"]], use_container_width=True)
+        st.dataframe(faltando[["matricula", "nome"]], use_container_width=True, hide_index=True)
     else:
         st.success("Todos os cartões foram arquivados nesse contrato!")
 
@@ -1140,14 +1659,29 @@ if menu == "Gestão de Usuários":
         st.dataframe(df_users, use_container_width=True)
 
         if not df_users.empty:
-            user_id = st.selectbox("Selecionar usuário para excluir", df_users["id"].tolist(), key="usr_del_id")
+            user_id = st.selectbox(
+                "Selecionar usuário para excluir",
+                df_users["id"].tolist(),
+                format_func=lambda uid: f"{df_users.loc[df_users['id']==uid,'username'].values[0]} | {df_users.loc[df_users['id']==uid,'perfil'].values[0]}",
+                key="usr_del_id",
+            )
             if st.button("Excluir Usuário", key="usr_del_btn"):
-                pool, conn, cur = get_conn_cursor()
-                try:
-                    cur.execute("DELETE FROM usuarios WHERE id=%s", (int(user_id),))
-                    close_conn(pool, conn, cur, commit=True)
-                    st.success("Usuário excluído!")
-                    st.rerun()
-                except Exception as e:
-                    close_conn(pool, conn, cur, commit=False)
-                    st.error(f"Erro ao excluir usuário: {e}")
+                alvo = df_users[df_users["id"] == user_id].iloc[0]
+                if alvo["username"] == st.session_state.usuario_logado:
+                    st.warning("Você não pode excluir o próprio usuário enquanto está conectado.")
+                elif alvo["perfil"] == "admin" and int((df_users["perfil"] == "admin").sum()) <= 1:
+                    st.warning("O sistema precisa manter pelo menos um administrador.")
+                else:
+                    pool, conn, cur = get_conn_cursor()
+                    try:
+                        cur.execute("DELETE FROM usuarios WHERE id=%s", (int(user_id),))
+                        registrar_log(
+                            cur, st.session_state.usuario_logado, "EXCLUSAO_USUARIO",
+                            f"Usuário excluído: {alvo['username']}"
+                        )
+                        close_conn(pool, conn, cur, commit=True)
+                        st.success("Usuário excluído!")
+                        st.rerun()
+                    except Exception as e:
+                        close_conn(pool, conn, cur, commit=False)
+                        st.error(f"Erro ao excluir usuário: {e}")
