@@ -311,6 +311,7 @@ def analisar_planilha_historica(conteudo_arquivo):
     return pd.DataFrame(resumo)
 
 
+@st.cache_data(show_spinner=False)
 def carregar_dados_aba_historica(conteudo_arquivo, aba):
     xls = pd.ExcelFile(io.BytesIO(conteudo_arquivo), engine="openpyxl")
     df = pd.read_excel(xls, sheet_name=aba, header=2, usecols="A:F", dtype=str)
@@ -329,6 +330,7 @@ def carregar_dados_aba_historica(conteudo_arquivo, aba):
     return df
 
 
+@st.cache_data(show_spinner=False)
 def carregar_mapa_localizacoes(conteudo_arquivo):
     mapa = {}
     try:
@@ -642,69 +644,276 @@ if menu == "Importar Histórico":
         "Ela migra os registros das abas mensais para o histórico do sistema."
     )
     st.caption(
-        "Regra usada: toda linha com matrícula + número da caixa será importada como ARQUIVADO, "
-        "com origem IMPORTACAO. Registros já existentes para a mesma matrícula e mês são preservados."
+        "Você pode enviar uma ou várias planilhas de uma vez. Toda linha com matrícula + número da caixa "
+        "será importada como ARQUIVADO, com origem IMPORTACAO. Registros já existentes para a mesma "
+        "matrícula e mês são preservados, inclusive quando o mesmo mês aparece em arquivos diferentes."
     )
 
-    arquivo_hist = st.file_uploader(
-        "Envie a planilha histórica (.xlsx)", type=["xlsx"], key="upl_historico"
+    arquivos_hist = st.file_uploader(
+        "Envie uma ou mais planilhas históricas (.xlsx)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="upl_historico_multi",
     )
 
-    if arquivo_hist is not None:
-        conteudo_hist = arquivo_hist.getvalue()
+    if arquivos_hist:
+        # Mantém bytes + nome em memória apenas durante a sessão atual.
+        # O índice diferencia arquivos que eventualmente tenham o mesmo nome.
+        arquivos_info = []
+        resumos = []
+
+        for indice_arquivo, arquivo_hist in enumerate(arquivos_hist):
+            conteudo_hist = arquivo_hist.getvalue()
+            arquivos_info.append({
+                "indice": indice_arquivo,
+                "nome": arquivo_hist.name,
+                "conteudo": conteudo_hist,
+            })
+
+            try:
+                resumo_arquivo = analisar_planilha_historica(conteudo_hist)
+            except Exception as e:
+                resumos.append(pd.DataFrame([{
+                    "arquivo_indice": indice_arquivo,
+                    "arquivo": arquivo_hist.name,
+                    "aba": "—",
+                    "mes": "—",
+                    "registros": 0,
+                    "duplicados": 0,
+                    "caixas": 0,
+                    "incompletos": 0,
+                    "localizacoes_ausentes": 0,
+                    "erro": f"Não foi possível analisar o arquivo: {e}",
+                }]))
+                continue
+
+            if resumo_arquivo.empty:
+                resumos.append(pd.DataFrame([{
+                    "arquivo_indice": indice_arquivo,
+                    "arquivo": arquivo_hist.name,
+                    "aba": "—",
+                    "mes": "—",
+                    "registros": 0,
+                    "duplicados": 0,
+                    "caixas": 0,
+                    "incompletos": 0,
+                    "localizacoes_ausentes": 0,
+                    "erro": "Nenhuma aba mensal no padrão MM.AAAA ou MM-AAAA foi encontrada.",
+                }]))
+                continue
+
+            resumo_arquivo = resumo_arquivo.copy()
+            resumo_arquivo.insert(0, "arquivo", arquivo_hist.name)
+            resumo_arquivo.insert(0, "arquivo_indice", indice_arquivo)
+            resumos.append(resumo_arquivo)
+
+        if not resumos:
+            st.warning("Nenhum arquivo pôde ser analisado.")
+            st.stop()
+
+        resumo_hist = pd.concat(resumos, ignore_index=True)
+
+        # ---------------------------------------------------------
+        # PRÉVIA INTELIGENTE DE DUPLICIDADES
+        # ---------------------------------------------------------
+        # "duplicados" acima significa somente matrícula repetida dentro da
+        # própria aba do Excel. Aqui também verificamos o que já está gravado
+        # no banco e o que se repete entre arquivos do mesmo lote.
+        resumo_hist["ja_existentes_app"] = 0
+        resumo_hist["repetidos_lote"] = 0
+        resumo_hist["novos_estimados"] = 0
+
+        linhas_validas_idx = resumo_hist.index[
+            (resumo_hist["erro"] == "") & (resumo_hist["aba"] != "—")
+        ].tolist()
+
+        dados_preview = {}
+        matriculas_por_mes = {}
+
+        # Lê as abas válidas (a função é cacheada) e agrupa matrículas por mês.
+        for idx in linhas_validas_idx:
+            arquivo_indice = int(resumo_hist.at[idx, "arquivo_indice"])
+            aba = str(resumo_hist.at[idx, "aba"])
+            mes_ref = str(resumo_hist.at[idx, "mes"])
+            try:
+                dados = carregar_dados_aba_historica(
+                    arquivos_info[arquivo_indice]["conteudo"], aba
+                )
+                dados_preview[(arquivo_indice, aba)] = dados
+                matriculas_por_mes.setdefault(mes_ref, set()).update(
+                    dados["matricula"].astype(str).tolist()
+                )
+            except Exception as e:
+                resumo_hist.at[idx, "erro"] = f"Erro ao preparar prévia: {e}"
+
+        # Consulta o banco uma única vez por mês para descobrir o que já existe.
+        existentes_app_por_mes = {}
+        pool = conn = cur = None
         try:
-            resumo_hist = analisar_planilha_historica(conteudo_hist)
+            pool, conn, cur = get_conn_cursor()
+            for mes_ref, mats_set in matriculas_por_mes.items():
+                mats = sorted(mats_set)
+                if not mats:
+                    existentes_app_por_mes[mes_ref] = set()
+                    continue
+                cur.execute(
+                    """
+                    SELECT cp.matricula
+                    FROM cartoes_ponto cp
+                    INNER JOIN meses m ON m.id = cp.mes_id
+                    WHERE m.mes_referencia=%s
+                      AND cp.matricula = ANY(%s)
+                    """,
+                    (mes_ref, mats),
+                )
+                existentes_app_por_mes[mes_ref] = {str(r[0]) for r in cur.fetchall()}
+            close_conn(pool, conn, cur, commit=True)
+            pool = conn = cur = None
         except Exception as e:
-            st.error(f"Não foi possível analisar a planilha: {e}")
-            st.stop()
+            if pool is not None or conn is not None:
+                close_conn(pool, conn, cur, commit=False)
+            st.error(f"Não foi possível comparar a prévia com os registros já existentes no app: {e}")
+            existentes_app_por_mes = {mes: set() for mes in matriculas_por_mes}
 
-        if resumo_hist.empty:
-            st.warning("Nenhuma aba mensal no padrão MM.AAAA ou MM-AAAA foi encontrada.")
-            st.stop()
+        # A ordem da tabela define qual ocorrência é considerada a primeira
+        # quando a mesma matrícula/mês aparece em mais de um arquivo do lote.
+        vistos_lote_por_mes = {}
+        for idx in linhas_validas_idx:
+            if str(resumo_hist.at[idx, "erro"]).strip():
+                continue
 
-        st.subheader("Prévia da importação")
+            arquivo_indice = int(resumo_hist.at[idx, "arquivo_indice"])
+            aba = str(resumo_hist.at[idx, "aba"])
+            mes_ref = str(resumo_hist.at[idx, "mes"])
+            dados = dados_preview.get((arquivo_indice, aba), pd.DataFrame())
+            mats = dados["matricula"].astype(str).tolist() if not dados.empty else []
+
+            existentes_app = existentes_app_por_mes.get(mes_ref, set())
+            ja_existentes = sum(1 for mat in mats if mat in existentes_app)
+
+            vistos = vistos_lote_por_mes.setdefault(mes_ref, set())
+            candidatos = [mat for mat in mats if mat not in existentes_app]
+            repetidos_lote = sum(1 for mat in candidatos if mat in vistos)
+            novos_estimados = len(candidatos) - repetidos_lote
+            vistos.update(candidatos)
+
+            resumo_hist.at[idx, "ja_existentes_app"] = int(ja_existentes)
+            resumo_hist.at[idx, "repetidos_lote"] = int(repetidos_lote)
+            resumo_hist.at[idx, "novos_estimados"] = int(novos_estimados)
+
+        st.subheader("Prévia geral da importação")
+        tabela_preview = resumo_hist[[
+            "arquivo", "aba", "mes", "registros", "duplicados",
+            "ja_existentes_app", "repetidos_lote", "novos_estimados",
+            "caixas", "incompletos", "localizacoes_ausentes", "erro"
+        ]].copy()
+        tabela_preview = tabela_preview.rename(columns={
+            "arquivo": "arquivo",
+            "aba": "aba",
+            "mes": "mês",
+            "registros": "registros válidos",
+            "duplicados": "duplicados na planilha",
+            "ja_existentes_app": "já existentes no app",
+            "repetidos_lote": "repetidos no lote",
+            "novos_estimados": "novos para importar",
+            "caixas": "caixas",
+            "incompletos": "linhas incompletas",
+            "localizacoes_ausentes": "localizações ausentes",
+            "erro": "erro",
+        })
         st.dataframe(
-            resumo_hist[[
-                "aba", "mes", "registros", "duplicados", "caixas", "incompletos", "localizacoes_ausentes", "erro"
-            ]],
+            tabela_preview,
             use_container_width=True,
             hide_index=True,
         )
 
-        total_registros_hist = int(resumo_hist["registros"].sum())
-        total_incompletos_hist = int(resumo_hist["incompletos"].sum())
-        total_duplicados_hist = int(resumo_hist["duplicados"].sum())
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Abas mensais", len(resumo_hist))
-        c2.metric("Registros válidos", total_registros_hist)
-        c3.metric("Duplicados ignorados", total_duplicados_hist)
-        c4.metric("Linhas incompletas", total_incompletos_hist)
+        linhas_validas = resumo_hist[
+            (resumo_hist["erro"] == "")
+            & (resumo_hist["aba"] != "—")
+        ].copy()
 
-        abas_validas = resumo_hist.loc[resumo_hist["erro"] == "", "aba"].tolist()
-        abas_selecionadas = st.multiselect(
-            "Abas que serão importadas",
-            abas_validas,
-            default=abas_validas,
-            key="hist_abas_selecionadas",
+        total_registros_hist = int(linhas_validas["registros"].sum()) if not linhas_validas.empty else 0
+        total_incompletos_hist = int(linhas_validas["incompletos"].sum()) if not linhas_validas.empty else 0
+        total_duplicados_hist = int(linhas_validas["duplicados"].sum()) if not linhas_validas.empty else 0
+        total_existentes_app = int(linhas_validas["ja_existentes_app"].sum()) if not linhas_validas.empty else 0
+        total_repetidos_lote = int(linhas_validas["repetidos_lote"].sum()) if not linhas_validas.empty else 0
+        total_novos_estimados = int(linhas_validas["novos_estimados"].sum()) if not linhas_validas.empty else 0
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Arquivos", len(arquivos_hist))
+        c2.metric("Abas", len(linhas_validas))
+        c3.metric("Registros válidos", total_registros_hist)
+        c4.metric("Já existentes no app", total_existentes_app)
+        c5.metric("Repetidos no lote", total_repetidos_lote)
+        c6.metric("Novos para importar", total_novos_estimados)
+
+        st.caption(
+            f"Duplicados dentro das próprias planilhas: {total_duplicados_hist} • "
+            f"Linhas incompletas: {total_incompletos_hist}. "
+            "A coluna 'já existentes no app' compara matrícula + mês com o banco antes da importação."
+        )
+
+        if linhas_validas.empty:
+            st.warning("Não há abas mensais válidas para importar nos arquivos enviados.")
+            st.stop()
+
+        if total_novos_estimados == 0 and total_registros_hist > 0:
+            st.warning(
+                "Todos os registros válidos desta seleção já existem no app ou estão repetidos no próprio lote. "
+                "Se você importar, nenhum cartão novo deverá ser criado."
+            )
+
+        # Cada item recebe um identificador único, inclusive quando dois arquivos têm o mesmo nome
+        # ou possuem a mesma aba mensal.
+        opcoes_importacao = []
+        mapa_opcoes = {}
+        for _, r in linhas_validas.iterrows():
+            arquivo_indice = int(r["arquivo_indice"])
+            aba = str(r["aba"])
+            nome_arquivo = str(r["arquivo"])
+            label = (
+                f"Arquivo {arquivo_indice + 1}: {nome_arquivo} | "
+                f"Aba {aba} | {int(r['registros'])} registro(s)"
+            )
+            opcoes_importacao.append(label)
+            mapa_opcoes[label] = (arquivo_indice, aba)
+
+        selecionados = st.multiselect(
+            "Arquivos/abas que serão importados",
+            opcoes_importacao,
+            default=opcoes_importacao,
+            key="hist_itens_selecionados_multi",
+        )
+
+        st.caption(
+            "Se o mesmo colaborador aparecer no mesmo mês em dois arquivos diferentes, "
+            "o primeiro registro importado será mantido e os seguintes serão contabilizados como já existentes."
         )
 
         confirmar = st.checkbox(
-            "Confirmo que revisei a prévia e desejo importar os registros selecionados.",
-            key="hist_confirmar",
+            "Confirmo que revisei a prévia e desejo importar os arquivos/abas selecionados.",
+            key="hist_confirmar_multi",
         )
 
         if st.button(
-            "📥 Importar histórico selecionado",
+            "📥 Importar tudo selecionado",
             type="primary",
-            disabled=not confirmar or not abas_selecionadas,
-            key="btn_importar_historico",
+            disabled=not confirmar or not selecionados,
+            key="btn_importar_historico_multi",
         ):
-            mapa_localizacoes = carregar_mapa_localizacoes(conteudo_hist)
+            itens_importacao = [mapa_opcoes[x] for x in selecionados]
             resultados = []
             barra = st.progress(0)
 
-            for pos, aba in enumerate(abas_selecionadas, start=1):
+            # Cache local por arquivo para evitar reler a aba CAIXAS várias vezes.
+            mapas_localizacoes = {}
+
+            for pos, (arquivo_indice, aba) in enumerate(itens_importacao, start=1):
+                info_arquivo = arquivos_info[arquivo_indice]
+                nome_arquivo = info_arquivo["nome"]
+                conteudo_hist = info_arquivo["conteudo"]
                 mes_ref = normalizar_mes_referencia(aba)
+
                 novos = 0
                 existentes = 0
                 erros = 0
@@ -713,6 +922,11 @@ if menu == "Importar Histórico":
 
                 try:
                     dados = carregar_dados_aba_historica(conteudo_hist, aba)
+
+                    if arquivo_indice not in mapas_localizacoes:
+                        mapas_localizacoes[arquivo_indice] = carregar_mapa_localizacoes(conteudo_hist)
+                    mapa_localizacoes = mapas_localizacoes[arquivo_indice]
+
                     pool, conn, cur = get_conn_cursor()
 
                     # 1) Garante o mês
@@ -723,7 +937,7 @@ if menu == "Importar Histórico":
                     cur.execute("SELECT id FROM meses WHERE mes_referencia=%s", (mes_ref,))
                     mes_id = int(cur.fetchone()[0])
 
-                    # 2) Localiza/cria caixas usadas na aba
+                    # 2) Localiza/cria as caixas usadas nesta aba
                     caixas_ids = {}
                     for numero_caixa in sorted(dados["numero_caixa"].unique().tolist()):
                         cur.execute(
@@ -731,9 +945,13 @@ if menu == "Importar Histórico":
                             (mes_id, numero_caixa),
                         )
                         achou = cur.fetchone()
+
                         loc_planilha = mapa_localizacoes.get((mes_ref, numero_caixa), "")
                         if not loc_planilha:
-                            locs_aba = dados.loc[dados["numero_caixa"] == numero_caixa, "localizacao"].dropna().astype(str).str.strip()
+                            locs_aba = (
+                                dados.loc[dados["numero_caixa"] == numero_caixa, "localizacao"]
+                                .dropna().astype(str).str.strip()
+                            )
                             locs_aba = locs_aba[locs_aba != ""]
                             if not locs_aba.empty:
                                 loc_planilha = locs_aba.iloc[0]
@@ -741,6 +959,7 @@ if menu == "Importar Histórico":
                         if achou:
                             caixa_id = int(achou[0])
                             loc_atual = achou[1] or ""
+                            # Só completa localização vazia. Nunca sobrescreve uma já existente.
                             if loc_planilha and not str(loc_atual).strip():
                                 cur.execute(
                                     "UPDATE caixas SET localizacao=%s WHERE id=%s",
@@ -756,7 +975,9 @@ if menu == "Importar Histórico":
 
                         caixas_ids[numero_caixa] = caixa_id
 
-                    # 3) Identifica o que já existe antes de inserir
+                    # 3) Verifica o que já existe naquele mês antes de inserir.
+                    # Como cada arquivo/aba é confirmado antes de passar ao próximo, isto também
+                    # protege contra duplicidade entre arquivos diferentes do mesmo lote.
                     mats = dados["matricula"].astype(str).tolist()
                     existentes_set = set()
                     if mats:
@@ -773,10 +994,12 @@ if menu == "Importar Histórico":
                         if mat in existentes_set:
                             existentes += 1
                             continue
+
                         caixa_id = caixas_ids.get(r["numero_caixa"])
                         if not caixa_id:
                             erros += 1
                             continue
+
                         registros_novos.append((
                             mat,
                             caixa_id,
@@ -784,14 +1007,14 @@ if menu == "Importar Histórico":
                             ts,
                             "ARQUIVADO",
                             "IMPORTACAO",
-                            arquivo_hist.name,
+                            nome_arquivo,
                             aba,
                             r.get("nome", ""),
                             r.get("contrato", ""),
                         ))
 
                     if registros_novos:
-                        execute_values(
+                        inseridos = execute_values(
                             cur,
                             """
                             INSERT INTO cartoes_ponto
@@ -799,18 +1022,23 @@ if menu == "Importar Histórico":
                              arquivo_origem, aba_origem, nome_historico, contrato_historico)
                             VALUES %s
                             ON CONFLICT (matricula, mes_id) DO NOTHING
+                            RETURNING id
                             """,
                             registros_novos,
                             page_size=2000,
+                            fetch=True,
                         )
-                        novos = len(registros_novos)
+                        novos = len(inseridos)
+                        # Caso outro usuário importe o mesmo mês ao mesmo tempo, o conflito
+                        # é contabilizado como existente em vez de inflar o total de novos.
+                        existentes += len(registros_novos) - novos
 
                     registrar_log(
                         cur,
                         st.session_state.usuario_logado,
                         "IMPORTACAO_HISTORICA",
                         (
-                            f"Arquivo {arquivo_hist.name} | Aba {aba} | Mes {mes_ref} | "
+                            f"Arquivo {nome_arquivo} | Aba {aba} | Mes {mes_ref} | "
                             f"Novos {novos} | Existentes {existentes} | Erros {erros} | "
                             f"Caixas criadas {caixas_criadas}"
                         ),
@@ -818,11 +1046,13 @@ if menu == "Importar Histórico":
 
                     close_conn(pool, conn, cur, commit=True)
                     pool = conn = cur = None
+
                 except Exception as e:
                     if pool is not None or conn is not None:
                         close_conn(pool, conn, cur, commit=False)
                     erros += 1
                     resultados.append({
+                        "arquivo": nome_arquivo,
                         "aba": aba,
                         "mes": mes_ref,
                         "novos": novos,
@@ -831,10 +1061,11 @@ if menu == "Importar Histórico":
                         "erros": erros,
                         "detalhe": str(e),
                     })
-                    barra.progress(pos / len(abas_selecionadas))
+                    barra.progress(pos / len(itens_importacao))
                     continue
 
                 resultados.append({
+                    "arquivo": nome_arquivo,
                     "aba": aba,
                     "mes": mes_ref,
                     "novos": novos,
@@ -843,10 +1074,19 @@ if menu == "Importar Histórico":
                     "erros": erros,
                     "detalhe": "OK",
                 })
-                barra.progress(pos / len(abas_selecionadas))
+                barra.progress(pos / len(itens_importacao))
 
-            st.success("Importação histórica finalizada.")
-            st.dataframe(pd.DataFrame(resultados), use_container_width=True, hide_index=True)
+            resultados_df = pd.DataFrame(resultados)
+            st.success("Importação histórica de múltiplas planilhas finalizada.")
+            st.dataframe(resultados_df, use_container_width=True, hide_index=True)
+
+            if not resultados_df.empty:
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Novos importados", int(resultados_df["novos"].sum()))
+                r2.metric("Já existentes", int(resultados_df["já existentes"].sum()))
+                r3.metric("Caixas criadas", int(resultados_df["caixas criadas"].sum()))
+                r4.metric("Erros", int(resultados_df["erros"].sum()))
+
             st.caption(
                 "Observação: data_registro representa a data da migração para o app. "
                 "A planilha não contém a data original em que o cartão foi fisicamente arquivado."
